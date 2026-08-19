@@ -39,6 +39,7 @@ public final class WzFolderMenu extends TreeMenu {
         add(btnPackage);
         add(btnUnload);
         add(btnReload);
+        add(btnMoveView);
         add(btnChangeKey);
         add(btnExport);
         add(btnLoadAll);

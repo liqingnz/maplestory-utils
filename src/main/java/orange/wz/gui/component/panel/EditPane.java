@@ -408,6 +408,17 @@ public final class EditPane extends JSplitPane {
     }
 
     /**
+     * 重新触发一次当前选中节点的单击事件
+     * <p>
+     * 用于 Character 预览开关切换后立刻刷新右侧表单
+     */
+    public void refreshCurrentSelection() {
+        TreePath selectedPath = tree.getSelectionPath();
+        if (selectedPath == null) return;
+        handleTreeClick((DefaultMutableTreeNode) selectedPath.getLastPathComponent());
+    }
+
+    /**
      * node 单击事件
      */
     private void handleTreeClick(DefaultMutableTreeNode node) {
@@ -428,6 +439,9 @@ public final class EditPane extends JSplitPane {
             }
             case WzImage obj -> {
                 getNodeForm().setData(obj.getName(), WzType.IMAGE.name(), wzObject, this);
+                if (MainFrame.getInstance().isCharacterPreview()) {
+                    getNodeForm().setImageInfo(obj);
+                }
                 switchForm("node");
             }
             case WzCanvasProperty obj -> {

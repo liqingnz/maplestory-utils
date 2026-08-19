@@ -53,6 +53,11 @@ public class MainFrame extends JFrame {
     private KeyManager keyManager;
     private JMenuItem viewShow;
 
+    /**
+     * Character 预览开关，开启后选中 img 时会额外展示它的 info 节点
+     */
+    private boolean characterPreview;
+
     private Color cavFormColor = null;
 
     private CenterPane centerPane;
@@ -147,11 +152,22 @@ public class MainFrame extends JFrame {
         view.add(viewShow);
         view.add(viewSync);
 
+        JCheckBoxMenuItem characterPreviewMenu = new JCheckBoxMenuItem(i18n.get("menu.tool.characterPreview"));
+        characterPreviewMenu.addActionListener(e -> {
+            characterPreview = characterPreviewMenu.isSelected();
+            // 立刻按新的开关状态重画当前选中的节点
+            centerPane.getLeftEditPane().refreshCurrentSelection();
+            if (centerPane.isRightShowing()) {
+                centerPane.getRightEditPane().refreshCurrentSelection();
+            }
+        });
+
         JMenuItem clearCB = new JMenuItem(i18n.get("menu.tool.clipboardClear"));
         JMenuItem gc = new JMenuItem(i18n.get("menu.tool.GC"));
 
         tools.add(selectCavBGC);
         tools.add(view);
+        tools.add(characterPreviewMenu);
         tools.add(clearCB);
         tools.add(gc);
 
