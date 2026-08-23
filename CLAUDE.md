@@ -22,7 +22,29 @@ mvn -DskipTests -Dmaven.antrun.skip=true -Dassembly.skipAssembly=true package
 
 这样 `target/OrzRepacker.jar` 保持未加密，`java -jar target/OrzRepacker.jar` 即可运行。
 
-发行版的 `OrzRepacker.exe` 不在仓库里（在 Release 的 Environment.7z 中），它的行为是把加密后的 jar 解到 `%TEMP%\OrzRepacker\<version>\data.bin`，然后用捆绑的 `jre\bin\java -Xmx25g --enable-native-access=ALL-UNNAMED -javaagent:data.bin -jar data.bin` 启动。本地要自制 exe 可以用 JDK 自带的 `jpackage --type app-image` 包上面那个未加密 jar，JVM 参数沿用 `-Xmx25g` 和 `--enable-native-access=ALL-UNNAMED`。
+发行版的 `OrzRepacker.exe` 不在仓库里（在 Release 的 Environment.7z 中），它的行为是把加密后的 jar 解到 `%TEMP%\OrzRepacker\<version>\data.bin`，然后用捆绑的 `jre\bin\java -Xmx25g --enable-native-access=ALL-UNNAMED -javaagent:data.bin -jar data.bin` 启动。
+
+### 自制 exe（jpackage app-image）
+
+**产物只放 `target/dist/OrzRepacker/`，不要再另建 `target/app`、`target/image` 之类的输出目录。** 先按上面出未加密 fat jar，然后：
+
+```bash
+mkdir -p target/jpackage-input && cp target/OrzRepacker.jar libcrypto-3-x64.dll target/jpackage-input/
+```
+
+```bash
+jpackage --type app-image --name OrzRepacker --app-version 1.162.50 --vendor OrzRepacker --input target/jpackage-input --main-jar OrzRepacker.jar --main-class org.springframework.boot.loader.JarLauncher --icon OrzRepacker.ico --java-options "-Xmx25g" --java-options "--enable-native-access=ALL-UNNAMED" --java-options "-Dfile.encoding=UTF-8" --dest target/dist
+```
+
+规则：
+
+- `--app-version` 用 `application.properties` 里 `version` 去掉开头的 `v`（jpackage 只收数字版本号）。
+- `--input` 是**暂存目录 `target/jpackage-input/`**，里面只放 `OrzRepacker.jar` + `libcrypto-3-x64.dll`（这个目录整个会被拷成 app-image 的 `app/`，也是 `java.library.path`，dll 要放这儿而不是 exe 同级）。**绝对不能把 `--input` 指向 `target/`**，否则 classes / lib / jre 全被打进去。
+- java-options 三个都要带：`-Xmx25g`、`--enable-native-access=ALL-UNNAMED`、`-Dfile.encoding=UTF-8`。
+- `OrzRepacker.ico`（仓库根目录，由 `src/main/resources/logo512.png` 生成的 16~256 多尺寸 ico）和 `libcrypto-3-x64.dll` 一样属于打包资源，放仓库根是为了 `mvn clean` 清不掉；logo 换了才需要重新生成。
+- jpackage 之前先确认没有 OrzRepacker 进程在跑，**运行中的 app-image 目录删不掉也覆盖不了**（jar / runtime 被占用），删一半会把正在跑的实例弄坏。
+- 这样出来的 exe 跑的是未加密 jar，不需要 `-javaagent`，代码也没混淆，和发行版不是一回事。
+- 首次运行会在 exe 同级生成 `keys.dat` 和 `logs/`，交付前删掉再打包分发。
 
 前端（仅 MCP/Web 模式需要）：
 
