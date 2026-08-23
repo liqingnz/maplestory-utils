@@ -4,6 +4,8 @@ import lombok.extern.slf4j.Slf4j;
 import orange.wz.gui.MainFrame;
 import orange.wz.gui.component.form.data.NodeFormData;
 import orange.wz.gui.component.panel.EditPane;
+import orange.wz.provider.WzDirectory;
+import orange.wz.provider.WzFolder;
 import orange.wz.provider.WzImage;
 import orange.wz.provider.WzImageProperty;
 import orange.wz.provider.WzObject;
@@ -15,37 +17,42 @@ import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.function.Function;
 
 @Slf4j
 public class NodeForm extends AbstractValueForm {
     /**
-     * info 下优先展示的节点，按这里的顺序排在最前面
+     * 优先展示的节点，按这里的顺序排在最前面
      */
-    private static final List<String> INFO_HEAD_NODES = List.of("icon", "iconRaw", "cash");
+    private static final List<String> HEAD_NODES = List.of("icon", "iconRaw", "cash");
+
+    /**
+     * 一次最多展示多少行，节点太多时只展示前面这些
+     */
+    private static final int MAX_ROWS = 100;
 
     /**
      * 图片行的固定边长，避免切换节点时行高跟着图片尺寸变化导致内容上下跳动
      */
     private static final int CANVAS_BOX_SIZE = 64;
 
-    private final JPanel infoPane = new JPanel(new GridBagLayout());
-    private final JScrollPane infoScrollPane = new JScrollPane(infoPane);
-    private int infoRow = 0;
+    private final JPanel previewPane = new JPanel(new GridBagLayout());
+    private final JScrollPane previewScrollPane = new JScrollPane(previewPane);
+    private int previewRow = 0;
 
     public NodeForm() {
         super();
 
-        infoScrollPane.setBorder(BorderFactory.createTitledBorder(MainFrame.i18n.get("form.character.info")));
-        infoScrollPane.getVerticalScrollBar().setUnitIncrement(16);
-        infoScrollPane.setVisible(false);
+        previewScrollPane.getVerticalScrollBar().setUnitIncrement(16);
+        previewScrollPane.setVisible(false);
 
-        valuePane.add(infoScrollPane, BorderLayout.CENTER);
+        valuePane.add(previewScrollPane, BorderLayout.CENTER);
     }
 
     public void setData(String name, String type, WzObject wzObject, EditPane editPane) {
         super.setData(name, type, wzObject, editPane);
-        // 默认不展示 info，img 节点会在之后单独调用 setImageInfo
-        clearImageInfo();
+        // 默认不展示预览，需要预览的节点会在之后单独调用 setImageInfo / setChildrenPreview
+        clearPreview();
     }
 
     /**
@@ -54,26 +61,21 @@ public class NodeForm extends AbstractValueForm {
      * @param wzImage 目标 img，为 null 时只清空
      */
     public void setImageInfo(WzImage wzImage) {
-        clearImageInfo();
+        clearPreview();
         if (wzImage == null) return;
 
-        boolean parsed;
-        try {
-            parsed = wzImage.parse();
-        } catch (Exception e) {
-            log.error("解析 img 失败: {}", wzImage.getPath(), e);
-            parsed = false;
-        }
-        if (!parsed) {
+        setPreviewTitle(MainFrame.i18n.get("form.character.info"));
+
+        if (!parse(wzImage)) {
             addHintRow(MainFrame.i18n.get("form.character.parse_failed", wzImage.getStatus().getMessage()));
-            showImageInfo();
+            showPreview();
             return;
         }
 
         WzImageProperty info = wzImage.getChild("info");
         if (info == null) {
             addHintRow(MainFrame.i18n.get("form.character.no_info"));
-            showImageInfo();
+            showPreview();
             return;
         }
 
@@ -82,19 +84,50 @@ public class NodeForm extends AbstractValueForm {
         if (children.isEmpty()) {
             addHintRow(MainFrame.i18n.get("form.character.empty_info"));
         } else {
-            for (WzImageProperty child : sortInfoChildren(children)) {
-                addInfoRow(child.getName(), createValueComponent(child));
-            }
+            addPropertyRows(children);
         }
 
         addFiller();
-        showImageInfo();
+        showPreview();
+    }
+
+    /**
+     * 默认预览：把节点的下一级展示到名称/类型的下方
+     *
+     * @param wzObject 目标节点，为 null 时只清空
+     */
+    public void setChildrenPreview(WzObject wzObject) {
+        clearPreview();
+        if (wzObject == null) return;
+
+        setPreviewTitle(MainFrame.i18n.get("form.preview.children"));
+
+        switch (wzObject) {
+            case WzImage image -> {
+                // img 的子节点要先解析出来
+                if (!parse(image)) {
+                    addHintRow(MainFrame.i18n.get("form.character.parse_failed", image.getStatus().getMessage()));
+                    showPreview();
+                    return;
+                }
+                addPropertyRows(image.getChildren());
+            }
+            // 值节点的 children 是 null，只有 List 类型的节点才能取子节点
+            case WzImageProperty property -> addPropertyRows(property.isListProperty() ? property.getChildren() : List.of());
+            case WzDirectory directory -> addObjectRows(directory.getChildren());
+            // 文件夹的 getChildren() 会顺带把目录下的 wz 都读进来，没展开过就不要在单击时触发
+            case WzFolder folder -> addObjectRows(folder.countChildren() == 0 ? List.of() : folder.getChildren());
+            default -> addHintRow(MainFrame.i18n.get("form.preview.empty"));
+        }
+
+        addFiller();
+        showPreview();
     }
 
     @Override
     public void onHide() {
         super.onHide();
-        clearImageInfo();
+        clearPreview();
     }
 
     @Override
@@ -102,32 +135,88 @@ public class NodeForm extends AbstractValueForm {
         return new NodeFormData(nameInput.getText(), typeInput.getText());
     }
 
+    private boolean parse(WzImage wzImage) {
+        try {
+            return wzImage.parse();
+        } catch (Exception e) {
+            log.error("解析 img 失败: {}", wzImage.getPath(), e);
+            return false;
+        }
+    }
+
     /**
-     * icon / iconRaw 排到最前面，其余节点保持 img 里的原始顺序
+     * WzImageProperty 子节点，值按类型渲染
      */
-    private List<WzImageProperty> sortInfoChildren(List<WzImageProperty> children) {
-        List<WzImageProperty> sorted = new ArrayList<>(children);
-        sorted.sort(Comparator.comparingInt(child -> headIndex(child.getName())));
+    private void addPropertyRows(List<WzImageProperty> children) {
+        if (children == null || children.isEmpty()) {
+            addHintRow(MainFrame.i18n.get("form.preview.empty"));
+            return;
+        }
+
+        addRows(children, WzImageProperty::getName, this::createValueComponent);
+    }
+
+    /**
+     * 文件夹 / wz 目录下的子节点，只展示类型
+     * <p>
+     * 这两种节点是展开时才把子节点读进来的，没有子节点基本等于还没展开
+     */
+    private void addObjectRows(List<WzObject> children) {
+        if (children == null || children.isEmpty()) {
+            addHintRow(MainFrame.i18n.get("form.preview.not_loaded"));
+            return;
+        }
+
+        addRows(children, WzObject::getName, child -> readOnlyField(child.getType().name()));
+    }
+
+    private <T> void addRows(List<T> children, Function<T, String> nameGetter, Function<T, JComponent> valueGetter) {
+        List<T> sorted = sortByHeadNodes(children, nameGetter);
+
+        int shown = Math.min(sorted.size(), MAX_ROWS);
+        for (int i = 0; i < shown; i++) {
+            T child = sorted.get(i);
+            addInfoRow(nameGetter.apply(child), valueGetter.apply(child));
+        }
+
+        if (sorted.size() > shown) {
+            addHintRow(MainFrame.i18n.get("form.preview.more", sorted.size() - shown));
+        }
+    }
+
+    /**
+     * icon 类节点排到最前面，其余节点保持原始顺序
+     */
+    private <T> List<T> sortByHeadNodes(List<T> children, Function<T, String> nameGetter) {
+        List<T> sorted = new ArrayList<>(children);
+        sorted.sort(Comparator.comparingInt((T child) -> headIndex(nameGetter.apply(child))));
         return sorted;
     }
 
     private int headIndex(String name) {
-        for (int i = 0; i < INFO_HEAD_NODES.size(); i++) {
-            if (INFO_HEAD_NODES.get(i).equalsIgnoreCase(name)) return i;
+        for (int i = 0; i < HEAD_NODES.size(); i++) {
+            if (HEAD_NODES.get(i).equalsIgnoreCase(name)) return i;
         }
-        return INFO_HEAD_NODES.size();
+        // 其它带 icon 的节点，例如 iconD / icon2 / stand1Icon
+        if (name != null && name.toLowerCase().contains("icon")) return HEAD_NODES.size();
+        return HEAD_NODES.size() + 1;
     }
 
-    private void clearImageInfo() {
-        infoPane.removeAll();
-        infoRow = 0;
-        infoScrollPane.setVisible(false);
+    private void setPreviewTitle(String title) {
+        previewScrollPane.setBorder(BorderFactory.createTitledBorder(title));
+    }
+
+    private void clearPreview() {
+        previewPane.removeAll();
+        previewRow = 0;
+        previewScrollPane.setVisible(false);
         valuePane.revalidate();
         valuePane.repaint();
     }
 
-    private void showImageInfo() {
-        infoScrollPane.setVisible(true);
+    private void showPreview() {
+        previewScrollPane.setVisible(true);
+        previewScrollPane.getVerticalScrollBar().setValue(0);
         valuePane.revalidate();
         valuePane.repaint();
     }
@@ -138,14 +227,14 @@ public class NodeForm extends AbstractValueForm {
     private void addInfoRow(String label, JComponent value) {
         GridBagConstraints labelGbc = baseGbc();
         labelGbc.gridx = 0;
-        labelGbc.gridy = infoRow;
+        labelGbc.gridy = previewRow;
         labelGbc.weightx = 0; // 标签不拉伸
         labelGbc.anchor = GridBagConstraints.NORTHWEST;
-        infoPane.add(new JLabel(label + ":"), labelGbc);
+        previewPane.add(new JLabel(label + ":"), labelGbc);
 
         GridBagConstraints valueGbc = baseGbc();
         valueGbc.gridx = 1;
-        valueGbc.gridy = infoRow;
+        valueGbc.gridy = previewRow;
         valueGbc.anchor = GridBagConstraints.NORTHWEST;
         if (value instanceof JLabel) { // 图片和提示文字保持原始大小
             valueGbc.weightx = 1.0;
@@ -154,21 +243,21 @@ public class NodeForm extends AbstractValueForm {
             valueGbc.weightx = 1.0;
             valueGbc.fill = GridBagConstraints.HORIZONTAL;
         }
-        infoPane.add(value, valueGbc);
+        previewPane.add(value, valueGbc);
 
-        infoRow++;
+        previewRow++;
     }
 
     private void addHintRow(String hint) {
         GridBagConstraints gbc = baseGbc();
         gbc.gridx = 0;
-        gbc.gridy = infoRow;
+        gbc.gridy = previewRow;
         gbc.gridwidth = 2;
         gbc.weightx = 1.0;
         gbc.anchor = GridBagConstraints.NORTHWEST;
-        infoPane.add(new JLabel(hint), gbc);
+        previewPane.add(new JLabel(hint), gbc);
 
-        infoRow++;
+        previewRow++;
     }
 
     /**
@@ -177,12 +266,12 @@ public class NodeForm extends AbstractValueForm {
     private void addFiller() {
         GridBagConstraints gbc = new GridBagConstraints();
         gbc.gridx = 0;
-        gbc.gridy = infoRow;
+        gbc.gridy = previewRow;
         gbc.weighty = 1.0;
         gbc.fill = GridBagConstraints.VERTICAL;
-        infoPane.add(Box.createVerticalGlue(), gbc);
+        previewPane.add(Box.createVerticalGlue(), gbc);
 
-        infoRow++;
+        previewRow++;
     }
 
     private JComponent createValueComponent(WzImageProperty property) {

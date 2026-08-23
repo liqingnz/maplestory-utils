@@ -410,12 +410,22 @@ public final class EditPane extends JSplitPane {
     /**
      * 重新触发一次当前选中节点的单击事件
      * <p>
-     * 用于 Character 预览开关切换后立刻刷新右侧表单
+     * 用于预览开关切换后立刻刷新右侧表单
      */
     public void refreshCurrentSelection() {
         TreePath selectedPath = tree.getSelectionPath();
         if (selectedPath == null) return;
         handleTreeClick((DefaultMutableTreeNode) selectedPath.getLastPathComponent());
+    }
+
+    /**
+     * 默认预览开关打开时，把节点的下一级展示到右边
+     *
+     * @param wzObject 当前选中的节点
+     */
+    private void previewChildren(WzObject wzObject) {
+        if (!MainFrame.getInstance().isDefaultPreview()) return;
+        getNodeForm().setChildrenPreview(wzObject);
     }
 
     /**
@@ -427,6 +437,7 @@ public final class EditPane extends JSplitPane {
         switch (wzObject) {
             case WzFolder obj -> {
                 getNodeForm().setData(obj.getName(), WzType.FOLDER.name(), wzObject, this);
+                previewChildren(obj);
                 switchForm("node");
             }
             case WzDirectory obj -> {
@@ -435,12 +446,15 @@ public final class EditPane extends JSplitPane {
                 } else {
                     getNodeForm().setData(obj.getName(), WzType.DIRECTORY.name(), wzObject, this);
                 }
+                previewChildren(obj);
                 switchForm("node");
             }
             case WzImage obj -> {
                 getNodeForm().setData(obj.getName(), WzType.IMAGE.name(), wzObject, this);
                 if (MainFrame.getInstance().isCharacterPreview()) {
                     getNodeForm().setImageInfo(obj);
+                } else {
+                    previewChildren(obj);
                 }
                 switchForm("node");
             }
@@ -450,6 +464,7 @@ public final class EditPane extends JSplitPane {
             }
             case WzConvexProperty obj -> {
                 getNodeForm().setData(obj.getName(), WzType.CONVEX_PROPERTY.name(), wzObject, this);
+                previewChildren(obj);
                 switchForm("node");
             }
             case WzDoubleProperty obj -> {
@@ -466,6 +481,7 @@ public final class EditPane extends JSplitPane {
             }
             case WzListProperty obj -> {
                 getNodeForm().setData(obj.getName(), WzType.LIST_PROPERTY.name(), wzObject, this);
+                previewChildren(obj);
                 switchForm("node");
             }
             case WzLongProperty obj -> {
@@ -1592,6 +1608,11 @@ public final class EditPane extends JSplitPane {
         }
 
         loadFiles(treeRoot, files, key);
+
+        // 记录打开过的文件夹，供菜单栏的"最近打开的文件夹"使用
+        files.stream()
+                .filter(File::isDirectory)
+                .forEach(RecentFolderUtil::add);
     }
 
     // 重载 -------------------------------------------------------------------------------------------------------------

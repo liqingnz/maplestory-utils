@@ -12,6 +12,7 @@ import orange.wz.gui.component.form.impl.CanvasForm;
 import orange.wz.gui.component.key.KeyBox;
 import orange.wz.gui.component.key.KeyManager;
 import orange.wz.gui.component.panel.CenterPane;
+import orange.wz.gui.utils.RecentFolderUtil;
 import orange.wz.gui.utils.UrlUtil;
 import orange.wz.manager.ServerManager;
 import orange.wz.provider.tools.wzkey.WzKey;
@@ -20,6 +21,8 @@ import orange.wz.provider.tools.wzkey.WzKeyStorage;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import javax.swing.*;
+import javax.swing.event.MenuEvent;
+import javax.swing.event.MenuListener;
 import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
@@ -54,7 +57,14 @@ public class MainFrame extends JFrame {
     private JMenuItem viewShow;
 
     /**
+     * 默认预览开关，开启后选中节点时会在右边展示它的下一级
+     */
+    private boolean defaultPreview;
+
+    /**
      * Character 预览开关，开启后选中 img 时会额外展示它的 info 节点
+     * <p>
+     * img 节点上优先级高于默认预览
      */
     private boolean characterPreview;
 
@@ -115,12 +125,14 @@ public class MainFrame extends JFrame {
 
         JMenuItem loadFiles = new JMenuItem(i18n.get("menu.file.loadFiles"), FcFileIcon);
         JMenuItem loadFolder = new JMenuItem(i18n.get("menu.file.loadFolders"), FcFolderIcon);
+        JMenu recentFolders = createRecentFolderMenu();
         JMenuItem newWz = new JMenuItem(i18n.get("menu.file.newWz"), AiOutlineFileWordIcon);
         JMenuItem newImg = new JMenuItem(i18n.get("menu.file.newImg"), AiOutlineFileMarkdownIcon);
         JMenuItem unloadAll = new JMenuItem(i18n.get("menu.file.unloadAll"), AiOutlineCloseIcon);
 
         fileMenu.add(loadFiles);
         fileMenu.add(loadFolder);
+        fileMenu.add(recentFolders);
         fileMenu.add(newWz);
         fileMenu.add(newImg);
         fileMenu.add(unloadAll);
@@ -152,14 +164,16 @@ public class MainFrame extends JFrame {
         view.add(viewShow);
         view.add(viewSync);
 
+        JCheckBoxMenuItem defaultPreviewMenu = new JCheckBoxMenuItem(i18n.get("menu.tool.defaultPreview"));
+        defaultPreviewMenu.addActionListener(e -> {
+            defaultPreview = defaultPreviewMenu.isSelected();
+            refreshSelection();
+        });
+
         JCheckBoxMenuItem characterPreviewMenu = new JCheckBoxMenuItem(i18n.get("menu.tool.characterPreview"));
         characterPreviewMenu.addActionListener(e -> {
             characterPreview = characterPreviewMenu.isSelected();
-            // 立刻按新的开关状态重画当前选中的节点
-            centerPane.getLeftEditPane().refreshCurrentSelection();
-            if (centerPane.isRightShowing()) {
-                centerPane.getRightEditPane().refreshCurrentSelection();
-            }
+            refreshSelection();
         });
 
         JMenuItem clearCB = new JMenuItem(i18n.get("menu.tool.clipboardClear"));
@@ -167,6 +181,7 @@ public class MainFrame extends JFrame {
 
         tools.add(selectCavBGC);
         tools.add(view);
+        tools.add(defaultPreviewMenu);
         tools.add(characterPreviewMenu);
         tools.add(clearCB);
         tools.add(gc);
@@ -246,6 +261,85 @@ public class MainFrame extends JFrame {
         newImg.addActionListener(e -> centerPane.getLeftEditPane().createImg());
 
         return menuBar;
+    }
+
+    /**
+     * 预览开关切换后，立刻按新的开关状态重画当前选中的节点
+     */
+    private void refreshSelection() {
+        centerPane.getLeftEditPane().refreshCurrentSelection();
+        if (centerPane.isRightShowing()) {
+            centerPane.getRightEditPane().refreshCurrentSelection();
+        }
+    }
+
+    /**
+     * 最近打开的文件夹菜单，每次展开时按最新的记录重建
+     */
+    private JMenu createRecentFolderMenu() {
+        JMenu menu = new JMenu(i18n.get("menu.file.recentFolders"));
+        menu.setIcon(FcFolderIcon);
+        fillRecentFolderMenu(menu);
+
+        menu.addMenuListener(new MenuListener() {
+            @Override
+            public void menuSelected(MenuEvent e) {
+                fillRecentFolderMenu(menu);
+            }
+
+            @Override
+            public void menuDeselected(MenuEvent e) {
+            }
+
+            @Override
+            public void menuCanceled(MenuEvent e) {
+            }
+        });
+
+        return menu;
+    }
+
+    private void fillRecentFolderMenu(JMenu menu) {
+        menu.removeAll();
+
+        List<File> folders = RecentFolderUtil.load();
+        if (folders.isEmpty()) {
+            JMenuItem empty = new JMenuItem(i18n.get("menu.file.recentFolders.empty"));
+            empty.setEnabled(false);
+            menu.add(empty);
+            return;
+        }
+
+        for (File folder : folders) {
+            JMenuItem item = new JMenuItem(folder.getAbsolutePath(), FcFolderIcon);
+            item.setToolTipText(folder.getAbsolutePath());
+            item.addActionListener(e -> openRecentFolder(folder));
+            menu.add(item);
+        }
+
+        menu.addSeparator();
+
+        JMenuItem clear = new JMenuItem(i18n.get("menu.file.recentFolders.clear"), AiOutlineCloseIcon);
+        clear.addActionListener(e -> {
+            RecentFolderUtil.clear();
+            setStatusText(i18n.get("status.recentFolderClear"));
+        });
+        menu.add(clear);
+    }
+
+    /**
+     * 打开一条最近记录，文件夹已经不在了就顺手把记录删掉
+     *
+     * @param folder 文件夹
+     */
+    private void openRecentFolder(File folder) {
+        if (!folder.isDirectory()) {
+            RecentFolderUtil.remove(folder);
+            setStatusTextWithWarnLog(i18n.get("warn.recent_folder_not_exists", folder.getAbsolutePath()));
+            return;
+        }
+
+        centerPane.getLeftEditPane().loadFiles(List.of(folder));
     }
 
     private JPanel createStatusBar() {
