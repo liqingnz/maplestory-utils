@@ -14,6 +14,35 @@ public class FileDialog {
     private static final Preferences prefs = Preferences.userNodeForPackage(FileDialog.class);
 
     /**
+     * 记忆路径的分组：加载 / 导入 / 导出 各记各的，避免导入导出互相覆盖，来回切换同一个路径
+     */
+    public static final String KEY_DEFAULT = "last";
+    public static final String KEY_OPEN = "last.open";
+    public static final String KEY_IMPORT = "last.import";
+    public static final String KEY_EXPORT = "last.export";
+
+    /**
+     * 读取该分组上次使用的目录
+     *
+     * @param prefKey 记忆分组，见 KEY_* 常量
+     * @return 上次的目录，没有记录返回 null
+     */
+    public static String getLastDir(String prefKey) {
+        return prefs.get(prefKey, null);
+    }
+
+    /**
+     * 记住该分组本次使用的目录（传入文件时记住它所在的目录）
+     */
+    public static void rememberDir(String prefKey, File file) {
+        if (file == null) return;
+        File dir = file.isDirectory() ? file : file.getParentFile();
+        if (dir != null) {
+            prefs.put(prefKey, dir.getAbsolutePath());
+        }
+    }
+
+    /**
      * 文件选择器
      *
      * @param parent     父组件，可 null
@@ -23,6 +52,10 @@ public class FileDialog {
      * @return 用户选择的文件列表，取消选择返回空列表
      */
     public static List<File> chooseOpenFiles(Component parent, String title, boolean allowMulti, String[] filters) {
+        return chooseOpenFiles(parent, title, allowMulti, filters, KEY_DEFAULT);
+    }
+
+    public static List<File> chooseOpenFiles(Component parent, String title, boolean allowMulti, String[] filters, String prefKey) {
         List<File> result = new ArrayList<>();
 
         SystemFileChooser chooser = new SystemFileChooser();
@@ -31,7 +64,7 @@ public class FileDialog {
         chooser.setMultiSelectionEnabled(allowMulti);
 
         // 恢复上次目录
-        String lastDir = prefs.get("last", null);
+        String lastDir = prefs.get(prefKey, null);
         if (lastDir != null) {
             chooser.setCurrentDirectory(new File(lastDir));
         }
@@ -51,7 +84,7 @@ public class FileDialog {
         }
 
         if (!result.isEmpty()) {
-            prefs.put("last", result.getFirst().toString());
+            rememberDir(prefKey, result.getFirst());
         }
 
         return result;
@@ -66,6 +99,10 @@ public class FileDialog {
      * @return 用户选择的文件夹列表，取消选择返回空列表
      */
     public static List<File> chooseOpenFolders(Component parent, String title, boolean allowMulti) {
+        return chooseOpenFolders(parent, title, allowMulti, KEY_DEFAULT);
+    }
+
+    public static List<File> chooseOpenFolders(Component parent, String title, boolean allowMulti, String prefKey) {
         List<File> result = new ArrayList<>();
 
         SystemFileChooser chooser = new SystemFileChooser();
@@ -74,7 +111,7 @@ public class FileDialog {
         chooser.setMultiSelectionEnabled(allowMulti);
 
         // 恢复上次目录
-        String lastDir = prefs.get("last", null);
+        String lastDir = prefs.get(prefKey, null);
         if (lastDir != null) {
             chooser.setCurrentDirectory(new File(lastDir));
         }
@@ -87,28 +124,36 @@ public class FileDialog {
         }
 
         if (!result.isEmpty()) {
-            prefs.put("last", result.getFirst().toString());
+            rememberDir(prefKey, result.getFirst());
         }
 
         return result;
     }
 
     public static List<File> chooseOpenFolders() {
-        return chooseOpenFolders(null, MainFrame.i18n.get("test.temp0149"), true);
+        return chooseOpenFolders(null, MainFrame.i18n.get("test.temp0149"), true, KEY_OPEN);
     }
 
     public static List<File> chooseOpenFiles(String[] filters) {
-        return chooseOpenFiles(null, MainFrame.i18n.get("test.temp0148"), true, filters);
+        return chooseOpenFiles(null, MainFrame.i18n.get("test.temp0148"), true, filters, KEY_OPEN);
+    }
+
+    public static List<File> chooseOpenFiles(String[] filters, String prefKey) {
+        return chooseOpenFiles(null, MainFrame.i18n.get("test.temp0148"), true, filters, prefKey);
     }
 
     public static File chooseOpenFolder(String title) {
-        List<File> selected = chooseOpenFolders(null, title, false);
+        return chooseOpenFolder(title, KEY_DEFAULT);
+    }
+
+    public static File chooseOpenFolder(String title, String prefKey) {
+        List<File> selected = chooseOpenFolders(null, title, false, prefKey);
         if (selected.isEmpty()) return null;
         return selected.getFirst();
     }
 
     public static File chooseOpenFile(String[] filters) {
-        List<File> files = chooseOpenFiles(null, MainFrame.i18n.get("test.temp0148"), false, filters);
+        List<File> files = chooseOpenFiles(null, MainFrame.i18n.get("test.temp0148"), false, filters, KEY_DEFAULT);
         if (files.isEmpty()) {
             return null;
         }

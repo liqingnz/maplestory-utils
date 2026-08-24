@@ -29,8 +29,11 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -78,6 +81,16 @@ public final class EditPane extends JSplitPane {
 
     private final SearchDialog searchDialog = new SearchDialog(MainFrame.i18n.get("search"), this);
     private final List<SearchResult> searchResults = new ArrayList<>();
+
+    // 视图对比的差异标记表：key 为差异节点，渲染器据此着色。弱引用，节点卸载后自动清理
+    private final Map<WzObject, DiffKind> diffMarks = Collections.synchronizedMap(new WeakHashMap<>());
+
+    // 视图对比的节点绑定：本侧树锚定路径 -> 对侧树锚定路径。对比时建立，定位/表单对比/替换优先走绑定，
+    // 使两侧文件名/路径不一致时也能对应
+    private final Map<String, String> diffBindings = new ConcurrentHashMap<>();
+
+    // 视图对比插入的占位节点（本侧缺失、对侧存在），只挂在树上、不进数据模型，清标记时一并移除
+    private final List<DefaultMutableTreeNode> ghostNodes = new ArrayList<>();
 
     // 按键搜索
     private final StringBuilder inputBuffer = new StringBuilder();
@@ -164,6 +177,18 @@ public final class EditPane extends JSplitPane {
             @Override
             public Component getTreeCellRendererComponent(JTree tree, Object value, boolean sel, boolean expanded, boolean leaf, int row, boolean hasFocus) {
                 super.getTreeCellRendererComponent(tree, value, sel, expanded, leaf, row, hasFocus);
+                setFont(tree.getFont()); // 渲染器组件被复用，先重置字体，避免占位节点的斜体泄漏到其他节点
+
+                // 对比占位节点：半透明名字提示，无图标
+                if (value instanceof DefaultMutableTreeNode ghostTreeNode && ghostTreeNode.getUserObject() instanceof DiffGhostObject ghost) {
+                    setIcon(null);
+                    DiffKind ghostKind = diffMarks.get(ghost);
+                    Color base = ghostKind != null ? ghostKind.getColor() : Color.GRAY;
+                    setForeground(new Color(base.getRed(), base.getGreen(), base.getBlue(), 110));
+                    setFont(getFont().deriveFont(Font.ITALIC));
+                    setText(ghost.getName() + "  (" + MainFrame.i18n.get("diff.ghost.hint") + ")");
+                    return this;
+                }
 
                 if (value instanceof DefaultMutableTreeNode node && node.getUserObject() instanceof WzObject obj) {
                     Icon icon = switch (obj.getType()) {
@@ -233,6 +258,10 @@ public final class EditPane extends JSplitPane {
                     if (obj.isTempChanged()) {
                         setForeground(Color.MAGENTA);
                     }
+                    DiffKind diffKind = diffMarks.get(obj);
+                    if (diffKind != null) {
+                        setForeground(diffKind.getColor());
+                    }
                     if (obj instanceof WzImageFile file && file.isErrorStatus()) {
                         setForeground(Color.RED);
                     } else if (obj instanceof WzDirectory dir && dir.isWzFile() && dir.getWzFile().isErrorStatus()) {
@@ -286,6 +315,9 @@ public final class EditPane extends JSplitPane {
                 // 显示菜单
                 DefaultMutableTreeNode node = (DefaultMutableTreeNode) path.getLastPathComponent();
                 WzObject wzObject = (WzObject) node.getUserObject();
+                if (wzObject instanceof DiffGhostObject) {
+                    return; // 对比占位节点没有可用操作
+                }
                 if (wzObject instanceof WzFolder) {
                     wzFolderPopupMenu.show(tree, e.getX(), e.getY());
                 } else if (wzObject instanceof WzDirectory directory) {
@@ -433,6 +465,23 @@ public final class EditPane extends JSplitPane {
      */
     private void handleTreeClick(DefaultMutableTreeNode node) {
         WzObject wzObject = (WzObject) node.getUserObject();
+
+        // 对比占位节点：展示名字和提示，并提供"复制视图节点"按钮把对侧真实节点复制过来
+        if (wzObject instanceof DiffGhostObject ghost) {
+            getNodeForm().setData(ghost.getName(), MainFrame.i18n.get("diff.ghost.hint"), null, this);
+            switchForm("node");
+            getNodeForm().hideDiffCompare();
+
+            EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+            Pair<WzObject, String> other = resolveOtherSide(otherPane, node);
+            if (other != null) {
+                getNodeForm().showGhostCopy(() -> replaceNodeContent(node, other.getLeft(), otherPane, other.getRight()));
+            }
+
+            MainFrame.getInstance().setStatusText(ghost.getName() + "  " + MainFrame.i18n.get("diff.ghost.hint"));
+            return;
+        }
+
         String npcAction = null;
         switch (wzObject) {
             case WzFolder obj -> {
@@ -532,9 +581,300 @@ public final class EditPane extends JSplitPane {
             }
         }
 
+        // 值节点带"值不同"标记时，在表单里追加显示对侧视图值和替换按钮
+        setupDiffCompare(node, wzObject);
+
         // 更新状态栏
         String text = getNodePathText(wzObject, npcAction);
         MainFrame.getInstance().setStatusText(text);
+    }
+
+    /**
+     * 节点有差异标记时，让当前表单显示对侧视图的值，并提供"使用视图值替换"按钮。
+     * 值节点：替换自身的值；容器节点（img/目录/List/Canvas 等）：递归替换子树里所有"值不同"的节点值。
+     */
+    private void setupDiffCompare(DefaultMutableTreeNode node, WzObject wzObject) {
+        AbstractValueForm form = nodeForms.get(currentFormName);
+        form.hideDiffCompare();
+
+        DiffKind mark = diffMarks.get(wzObject);
+        if (mark == null) return;
+
+        EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+        Pair<WzObject, String> other = resolveOtherSide(otherPane, node);
+        if (other == null) return;
+
+        WzObject otherObj = other.getLeft();
+        String otherPath = other.getRight();
+
+        // 值替换：要求两侧类型一致；值节点还要求确实是"值不同"，容器节点则递归替换子树的值
+        boolean singleValue = isDiffReplaceSupported(wzObject);
+        boolean bulk = isBulkReplaceSupported(wzObject);
+        boolean sameType = otherObj.getType() == wzObject.getType();
+        boolean valueReplace = sameType && (singleValue ? mark == DiffKind.MODIFIED : bulk);
+
+        // 整节点替换：不要求两侧类型一致（类型不同的节点正需要整个换掉），只要求父容器能接收对方
+        boolean nodeFromViewOk = isNodeReplaceSupported(wzObject, otherObj);
+        boolean nodeToViewOk = isNodeReplaceSupported(otherObj, wzObject);
+
+        if (!valueReplace && !nodeFromViewOk && !nodeToViewOk) return;
+
+        Runnable valuesFromView = null;
+        Runnable valuesToView = null;
+        if (valueReplace) {
+            valuesFromView = singleValue
+                    ? () -> applyOtherViewValue(node, wzObject, otherObj, otherPath)
+                    : () -> applyOtherViewValues(node, wzObject, otherObj, otherPath);
+            valuesToView = singleValue
+                    ? () -> applyValueToView(node, wzObject, otherObj, otherPath)
+                    : () -> applyValuesToView(node, wzObject, otherObj, otherPath);
+        }
+
+        form.showDiffCompare(WzDiffUtil.valueText(otherObj),
+                valuesFromView,
+                valuesToView,
+                nodeFromViewOk ? () -> replaceNodeFromView(node, otherObj, otherPath) : null,
+                nodeToViewOk ? () -> replaceViewNode(otherPath, node, wzObject) : null);
+    }
+
+    /**
+     * 能否用 source 整个替换掉 target：两边都不是文件夹，且 target 的父容器能接收 source 这种类型
+     */
+    private boolean isNodeReplaceSupported(WzObject target, WzObject source) {
+        if (target instanceof WzFolder || source instanceof WzFolder) return false;
+
+        WzObject parentObj = target.getParent();
+        if (parentObj == null) return false;
+
+        // 与 addWzObjChild 支持的父子组合保持一致
+        return switch (parentObj) {
+            case WzDirectory ignored -> source instanceof WzDirectory || source instanceof WzImage;
+            case WzImage ignored -> source instanceof WzImageProperty;
+            case WzImageProperty pProp when pProp.isListProperty() -> source instanceof WzImageProperty;
+            default -> false;
+        };
+    }
+
+    private boolean isDiffReplaceSupported(WzObject wzObject) {
+        return wzObject instanceof WzStringProperty
+                || wzObject instanceof WzIntProperty
+                || wzObject instanceof WzShortProperty
+                || wzObject instanceof WzLongProperty
+                || wzObject instanceof WzFloatProperty
+                || wzObject instanceof WzDoubleProperty
+                || wzObject instanceof WzVectorProperty
+                || wzObject instanceof WzUOLProperty;
+    }
+
+    private boolean isBulkReplaceSupported(WzObject wzObject) {
+        return wzObject instanceof WzFolder
+                || wzObject instanceof WzDirectory
+                || wzObject instanceof WzImage
+                || (wzObject instanceof WzImageProperty prop && prop.isListProperty());
+    }
+
+    /**
+     * 用对侧视图的值覆盖本侧节点的值，同步清掉两侧的差异标记并刷新界面
+     */
+    private void applyOtherViewValue(DefaultMutableTreeNode node, WzObject thisObj, WzObject otherObj, String otherPath) {
+        if (!WzDiffUtil.copyValue(otherObj, thisObj)) return;
+
+        EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+        diffMarks.remove(thisObj);
+        otherPane.getDiffMarks().remove(otherObj);
+        refreshAfterDiffReplace(node, otherPane, otherPath);
+    }
+
+    /**
+     * 反向：用本侧节点的值覆盖对侧视图节点的值
+     */
+    private void applyValueToView(DefaultMutableTreeNode node, WzObject thisObj, WzObject otherObj, String otherPath) {
+        if (!WzDiffUtil.copyValue(thisObj, otherObj)) return;
+
+        EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+        diffMarks.remove(thisObj);
+        otherPane.getDiffMarks().remove(otherObj);
+        refreshAfterDiffReplace(node, otherPane, otherPath);
+    }
+
+    /**
+     * 批量替换：把对侧视图子树里的值递归写入本侧子树所有"值不同"的节点
+     */
+    private void applyOtherViewValues(DefaultMutableTreeNode node, WzObject thisObj, WzObject otherObj, String otherPath) {
+        EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+        runBulkValueReplace(() -> WzDiffUtil.applyValues(otherObj, thisObj, diffMarks, otherPane.getDiffMarks()), node, otherPane, otherPath);
+    }
+
+    /**
+     * 反向批量替换：把本侧子树里的值递归写入对侧视图子树所有"值不同"的节点
+     */
+    private void applyValuesToView(DefaultMutableTreeNode node, WzObject thisObj, WzObject otherObj, String otherPath) {
+        EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+        runBulkValueReplace(() -> WzDiffUtil.applyValues(thisObj, otherObj, otherPane.getDiffMarks(), diffMarks), node, otherPane, otherPath);
+    }
+
+    private void runBulkValueReplace(java.util.function.Supplier<Integer> replaceTask, DefaultMutableTreeNode node, EditPane otherPane, String otherPath) {
+        new SwingWorker<Integer, Void>() {
+            @Override
+            protected Integer doInBackground() {
+                return replaceTask.get();
+            }
+
+            @Override
+            protected void done() {
+                int count;
+                try {
+                    count = get();
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex);
+                }
+
+                refreshAfterDiffReplace(node, otherPane, otherPath);
+                MainFrame.getInstance().setStatusText(MainFrame.i18n.get("diff.replace.done", count));
+            }
+        }.execute();
+    }
+
+    private void refreshAfterDiffReplace(DefaultMutableTreeNode node, EditPane otherPane, String otherPath) {
+        cleanupAncestorMarks(node);
+        otherPane.cleanupAncestorMarksByPath(otherPath);
+        tree.repaint();
+        otherPane.getTree().repaint();
+        refreshCurrentSelection();
+        otherPane.refreshCurrentSelection();
+    }
+
+    /**
+     * 替换操作后向上递归清理"含差异"标记：某一级的全部子节点（含占位节点、未物化的模型子节点）
+     * 都不再带差异标记时，该级的标记清除并标脏（与替换过的节点同色），继续向上一级判断
+     */
+    private void cleanupAncestorMarks(DefaultMutableTreeNode node) {
+        if (node == null) return;
+        for (DefaultMutableTreeNode p = (DefaultMutableTreeNode) node.getParent(); p != null; p = (DefaultMutableTreeNode) p.getParent()) {
+            if (!(p.getUserObject() instanceof WzObject obj)) return;
+            if (diffMarks.get(obj) != DiffKind.PARENT) return;
+            if (hasMarkedChild(p, obj)) return;
+
+            diffMarks.remove(obj);
+            obj.setTempChanged(true);
+        }
+    }
+
+    private void cleanupAncestorMarksByPath(String path) {
+        cleanupAncestorMarks(findTreeNodeByPath(path));
+    }
+
+    private boolean hasMarkedChild(DefaultMutableTreeNode node, WzObject obj) {
+        // 模型子节点（覆盖树上未物化的部分）
+        List<? extends WzObject> children = WzDiffUtil.childrenOf(obj);
+        if (children != null) {
+            for (WzObject child : children) {
+                if (diffMarks.containsKey(child)) return true;
+            }
+        }
+        // 树子节点（覆盖只挂在树上的占位节点）
+        for (int i = 0; i < node.getChildCount(); i++) {
+            if (((DefaultMutableTreeNode) node.getChildAt(i)).getUserObject() instanceof DiffGhostObject ghost
+                    && diffMarks.containsKey(ghost)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 整节点替换：用对侧视图节点完整替换本侧选中节点（深克隆，包含全部子孙结构）
+     */
+    private void replaceNodeFromView(DefaultMutableTreeNode thisNode, WzObject otherObj, String otherPath) {
+        EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+        replaceNodeContent(thisNode, otherObj, otherPane, otherPath);
+    }
+
+    /**
+     * 整节点替换（反向）：用本侧节点完整替换对侧视图的对应节点
+     */
+    private void replaceViewNode(String otherPath, DefaultMutableTreeNode thisNode, WzObject thisObj) {
+        EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+        DefaultMutableTreeNode otherNode = otherPane.revealDiffPath(otherPath);
+        if (otherNode == null) {
+            MainFrame.getInstance().setStatusTextWithErrLog(MainFrame.i18n.get("diff.error.no_target", otherPath));
+            return;
+        }
+        otherPane.replaceNodeContent(otherNode, thisObj, this, anchoredNodePath(thisNode));
+    }
+
+    /**
+     * 在本面板里用 sourceObj 的深克隆完整替换 targetNode（保留原节点名和位置），接线方式与剪贴板粘贴一致
+     *
+     * @param sourcePane sourceObj 所在的面板（用于清理其子树的差异标记）
+     * @param sourcePath sourceObj 在其面板里的树锚定路径（用于向上清理"含差异"标记）
+     */
+    private void replaceNodeContent(DefaultMutableTreeNode targetNode, WzObject sourceObj, EditPane sourcePane, String sourcePath) {
+        WzObject targetObj = (WzObject) targetNode.getUserObject();
+        DefaultMutableTreeNode parentNode = (DefaultMutableTreeNode) targetNode.getParent();
+
+        boolean parentSupported = parentNode != null
+                && parentNode.getUserObject() instanceof WzObject parentCheck
+                && (parentCheck instanceof WzDirectory
+                || parentCheck instanceof WzImage
+                || (parentCheck instanceof WzImageProperty pp && pp.isListProperty()));
+        if (!parentSupported || targetObj instanceof WzFolder || sourceObj instanceof WzFolder) {
+            MainFrame.getInstance().setStatusTextWithWarnLog(MainFrame.i18n.get("diff.replace.unsupported", targetObj.getName()));
+            return;
+        }
+        WzObject parentObj = (WzObject) parentNode.getUserObject();
+
+        new SwingWorker<WzObject, Void>() {
+            @Override
+            protected WzObject doInBackground() {
+                return sourceObj.deepClone(null); // 深克隆较重（Canvas 全部解码进内存），放后台
+            }
+
+            @Override
+            protected void done() {
+                WzObject clone;
+                try {
+                    clone = get();
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex);
+                }
+
+                clone.setNameAnyway(targetObj.getName());
+                clone.setParent(parentObj);
+
+                // 接线 reader / wzImage，与 doPaste 一致
+                if (parentObj instanceof WzDirectory wzDirectory) {
+                    setPasteWzFileAndReader(List.of(clone), wzDirectory.getWzFile());
+                } else if (parentObj instanceof WzImage wzImg) {
+                    setPasteWzImage(List.of(clone), wzImg);
+                } else if (parentObj instanceof WzImageProperty wzProp) {
+                    setPasteWzImage(List.of(clone), wzProp.getWzImage());
+                }
+                clone.setTempChanged(true);
+
+                int index = parentNode.getIndex(targetNode);
+                if (targetObj instanceof DiffGhostObject) {
+                    // 占位节点不在数据模型里，只清理树和标记
+                    diffMarks.remove(targetObj);
+                    ghostNodes.remove(targetNode);
+                } else {
+                    removeWzObjChild(parentObj, targetObj);
+                }
+                removeNodeFromTree(targetNode);
+                addWzObjChild(parentObj, clone);
+                DefaultMutableTreeNode newNode = insertNodeToTree(parentNode, clone, true, index);
+
+                // 两侧内容已一致，清掉来源子树的差异标记（目标侧旧对象随移除自动失效），并向上递归清理"含差异"标记
+                WzDiffUtil.clearMarks(sourceObj, sourcePane.getDiffMarks());
+                cleanupAncestorMarks(newNode);
+                sourcePane.cleanupAncestorMarksByPath(sourcePath);
+
+                tree.repaint();
+                sourcePane.getTree().repaint();
+                tree.setSelectionPath(new TreePath(newNode.getPath()));
+                MainFrame.getInstance().setStatusText(MainFrame.i18n.get("diff.replace.node_done", clone.getName()));
+            }
+        }.execute();
     }
 
     private String getNodePathText(WzObject wzObject, String npcAction) {
@@ -989,6 +1329,65 @@ public final class EditPane extends JSplitPane {
         }
 
         return null;
+    }
+
+    /**
+     * 根据路径直接在 WzObject 数据模型里查找对象（必要时触发 parse），不依赖树节点是否已展开。
+     * <p>
+     * 与 {@link #findWzObjectInTreeByPath(String)} 的区别：后者靠树节点寻路，未展开的层级依赖异步展开，
+     * 从后台线程调用时可能因为节点尚未物化而找不到；本方法在数据模型上同步寻路，适合后台任务使用。
+     *
+     * @param path 用 / 隔开，不含 Root
+     * @return WzObject，找不到返回 null
+     */
+    public WzObject findWzObjectByModelPath(String path) {
+        String[] paths = path.split("/");
+
+        WzObject current = null;
+        for (int i = 0; i < treeRoot.getChildCount(); i++) {
+            WzObject obj = (WzObject) ((DefaultMutableTreeNode) treeRoot.getChildAt(i)).getUserObject();
+            if (obj.getName().equals(paths[0])) {
+                current = obj;
+                break;
+            }
+        }
+
+        for (int i = 1; i < paths.length && current != null; i++) {
+            current = findModelChildByName(current, paths[i]);
+        }
+        return current;
+    }
+
+    private WzObject findModelChildByName(WzObject parent, String name) {
+        switch (parent) {
+            case WzFolder folder -> {
+                for (WzObject child : folder.getChildren()) {
+                    if (child.getName().equals(name)) return child;
+                }
+                return null;
+            }
+            case WzDirectory wzDir -> {
+                if (wzDir.isWzFile() && !wzDir.getWzFile().parse()) {
+                    MainFrame.getInstance().setStatusTextWithErrLog(MainFrame.i18n.get("error.parse", wzDir.getName(), wzDir.getWzFile().getStatus().getMessage()));
+                    return null;
+                }
+                WzDirectory dir = wzDir.getDirectory(name);
+                return dir != null ? dir : wzDir.getImage(name);
+            }
+            case WzImage wzImg -> {
+                if (!wzImg.parse()) {
+                    MainFrame.getInstance().setStatusTextWithErrLog(MainFrame.i18n.get("error.parse", wzImg.getName(), wzImg.getStatus().getMessage()));
+                    return null;
+                }
+                return wzImg.getChild(name);
+            }
+            case WzImageProperty prop -> {
+                return prop.getChild(name);
+            }
+            default -> {
+                return null;
+            }
+        }
     }
 
     /**
@@ -1940,7 +2339,7 @@ public final class EditPane extends JSplitPane {
         TreePath[] selectedPaths = tree.getSelectionPaths();
         if (selectedPaths == null) return;
 
-        File folder = FileDialog.chooseOpenFolder(MainFrame.i18n.get("test.temp0005"));
+        File folder = FileDialog.chooseOpenFolder(MainFrame.i18n.get("test.temp0005"), FileDialog.KEY_EXPORT);
         if (folder == null) {
             log.info(MainFrame.i18n.get("test.temp0006"));
             return;
@@ -2169,7 +2568,7 @@ public final class EditPane extends JSplitPane {
         if (TreePathUtil.isNullOrMultiple(selectedPaths)) return;
 
         DefaultMutableTreeNode node = (DefaultMutableTreeNode) selectedPaths[0].getLastPathComponent();
-        List<File> imgFiles = FileDialog.chooseOpenFiles(new String[]{"img"});
+        List<File> imgFiles = FileDialog.chooseOpenFiles(new String[]{"img"}, FileDialog.KEY_IMPORT);
         attachImg(node, imgFiles);
     }
 
@@ -2248,7 +2647,7 @@ public final class EditPane extends JSplitPane {
         if (TreePathUtil.isNullOrMultiple(selectedPaths)) return;
 
         DefaultMutableTreeNode node = (DefaultMutableTreeNode) selectedPaths[0].getLastPathComponent();
-        List<File> xmlFiles = FileDialog.chooseOpenFiles(new String[]{"xml"});
+        List<File> xmlFiles = FileDialog.chooseOpenFiles(new String[]{"xml"}, FileDialog.KEY_IMPORT);
         attachXml(node, xmlFiles);
     }
 
@@ -2611,22 +3010,28 @@ public final class EditPane extends JSplitPane {
         }
     }
 
+    /**
+     * 粘贴到全部选中的节点（多选 List 时会把剪贴板内容分别粘贴到每个 List 下，每个目标各拿一份独立的克隆）
+     */
     public void doPaste() {
         TreePath[] selectedPaths = tree.getSelectionPaths();
         if (selectedPaths == null) return;
 
         Clipboard clipboard = MainFrame.getInstance().getClipboard();
         clipboard.lock();
+
+        if (clipboard.isEmpty()) {
+            JMessageUtil.error(MainFrame.i18n.get("test.temp0028"));
+            clipboard.unlock();
+            return;
+        }
+
         OverwriteChoice choice = null;
+        int pastedTargets = 0;
+        int rejectedTargets = 0;
         for (TreePath treePath : selectedPaths) {
             DefaultMutableTreeNode node = (DefaultMutableTreeNode) treePath.getLastPathComponent();
             WzObject to = (WzObject) node.getUserObject();
-
-            if (clipboard.isEmpty()) {
-                JMessageUtil.error(MainFrame.i18n.get("test.temp0028"));
-                clipboard.unlock();
-                return;
-            }
 
             if (to instanceof WzImage image) {
                 image.parse();
@@ -2634,59 +3039,75 @@ public final class EditPane extends JSplitPane {
                 wzDir.getWzFile().parse();
             }
 
-            if (clipboard.canPaste(to)) {
-                List<WzObject> cpItems = clipboard.getItems();
-                cpItems.forEach(cpItem -> cpItem.setParent(to)); // 复制的时候顶级对象没有 parent
+            // 目标类型不匹配时跳过该目标，继续粘贴其余目标
+            if (!clipboard.canPaste(to)) {
+                rejectedTargets++;
+                continue;
+            }
 
-                // 这里的对象类型和canPaste保持一致
-                if (to instanceof WzDirectory wzDirectory) {
-                    setPasteWzFileAndReader(cpItems, wzDirectory.getWzFile());
-                } else if (to instanceof WzImage wzImg) {
-                    setPasteWzImage(cpItems, wzImg);
-                } else if (to instanceof WzImageProperty wzProp && wzProp.isListProperty()) {
-                    setPasteWzImage(cpItems, wzProp.getWzImage());
-                }
+            List<WzObject> cpItems = clipboard.getItems(); // 每个目标一份独立克隆
+            cpItems.forEach(cpItem -> cpItem.setParent(to)); // 复制的时候顶级对象没有 parent
 
-                for (WzObject item : cpItems) {
-                    item.setTempChanged(true);
-                    int index = 0;
-                    if (isWzObjExistChild(to, item)) { // 发现重名
-                        if (choice == OverwriteChoice.SKIP_ALL) continue;
-                        else if (choice == OverwriteChoice.OVERWRITE_ALL) {
-                            removeWzObjChild(to, item);
-                            DefaultMutableTreeNode childNode = findTreeNodeByName(node, item.getName());
-                            index = node.getIndex(childNode);
-                            removeNodeFromTree(childNode);
-                        } else {
-                            choice = OverwriteDialog.show(this, item.getName());
-                            switch (choice) {
-                                case OVERWRITE, OVERWRITE_ALL -> {
-                                    removeWzObjChild(to, item);
-                                    DefaultMutableTreeNode childNode = findTreeNodeByName(node, item.getName());
-                                    index = node.getIndex(childNode);
-                                    removeNodeFromTree(childNode);
-                                }
-                                case SKIP, SKIP_ALL, CANCEL -> {
-                                    continue;
-                                }
+            // 这里的对象类型和canPaste保持一致
+            if (to instanceof WzDirectory wzDirectory) {
+                setPasteWzFileAndReader(cpItems, wzDirectory.getWzFile());
+            } else if (to instanceof WzImage wzImg) {
+                setPasteWzImage(cpItems, wzImg);
+            } else if (to instanceof WzImageProperty wzProp && wzProp.isListProperty()) {
+                setPasteWzImage(cpItems, wzProp.getWzImage());
+            }
+
+            for (WzObject item : cpItems) {
+                item.setTempChanged(true);
+                int index = -1; // -1 = 追加到末尾，和数据模型的顺序保持一致
+                if (isWzObjExistChild(to, item)) { // 发现重名
+                    if (choice == OverwriteChoice.SKIP_ALL) continue;
+                    else if (choice == OverwriteChoice.OVERWRITE_ALL) {
+                        index = removeExistChild(node, to, item);
+                    } else {
+                        choice = OverwriteDialog.show(this, item.getName());
+                        switch (choice) {
+                            case OVERWRITE, OVERWRITE_ALL -> index = removeExistChild(node, to, item);
+                            case SKIP, SKIP_ALL, CANCEL -> {
+                                continue;
                             }
                         }
                     }
-                    addWzObjChild(to, item); // 已经设置 changed 了
-
-                    if (!node.isLeaf()) {
-                        insertNodeToTree(node, item, false, index);
-                    }
                 }
-            } else {
-                JMessageUtil.error(MainFrame.i18n.get("test.temp0029", to.getClass().getSimpleName()));
-                clipboard.unlock();
-                return;
+                addWzObjChild(to, item); // 已经设置 changed 了
+
+                if (!node.isLeaf()) {
+                    insertNodeToTree(node, item, false, index);
+                }
             }
+            pastedTargets++;
         }
 
-        resetValueForm();
         clipboard.unlock();
+        resetValueForm();
+        tree.repaint(); // 刷新节点上的子节点数量
+
+        if (rejectedTargets > 0) {
+            MainFrame.getInstance().setStatusTextWithWarnLog(MainFrame.i18n.get("paste.done_with_reject", pastedTargets, rejectedTargets));
+        } else {
+            MainFrame.getInstance().setStatusText(MainFrame.i18n.get("paste.done", pastedTargets));
+        }
+    }
+
+    /**
+     * 覆盖粘贴前移除同名的旧节点
+     *
+     * @return 旧节点在树里的位置（树上还没展开出该节点时返回 -1，表示追加）
+     */
+    private int removeExistChild(DefaultMutableTreeNode node, WzObject to, WzObject item) {
+        removeWzObjChild(to, item);
+
+        DefaultMutableTreeNode childNode = findTreeNodeByName(node, item.getName());
+        if (childNode == null) return -1; // 目标节点在树上未展开，没有对应的树节点
+
+        int index = node.getIndex(childNode);
+        removeNodeFromTree(childNode);
+        return index;
     }
 
     // 新建文件 ----------------------------------------------------------------------------------------------------------
@@ -2850,6 +3271,492 @@ public final class EditPane extends JSplitPane {
                 }
             }
         }.execute();
+    }
+
+    // 视图对比 ----------------------------------------------------------------------------------------------------------
+    /** 自动展开差异路径的数量上限，超出部分通过结果对话框双击跳转 */
+    private static final int MAX_DIFF_REVEAL = 500;
+    /** 占位节点的数量上限（独立于展开上限，缺失提示不能因为值差异太多而被挤掉） */
+    private static final int MAX_DIFF_GHOSTS = 2000;
+
+    /**
+     * 将选中节点与对侧视图的同路径节点递归对比，差异节点在两侧树里着色标注，并弹出结果列表
+     */
+    public void diffWithOtherPane() {
+        TreePath[] selectedPaths = tree.getSelectionPaths();
+        if (selectedPaths == null) return;
+
+        EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+        clearDiffMarks();
+        otherPane.clearDiffMarks();
+
+        new SwingWorker<WzDiffUtil.DiffContext, Void>() {
+            @Override
+            protected WzDiffUtil.DiffContext doInBackground() {
+                WzDiffUtil.DiffContext ctx = new WzDiffUtil.DiffContext(diffMarks, otherPane.getDiffMarks());
+                try {
+                    for (TreePath treePath : selectedPaths) {
+                        DefaultMutableTreeNode node = (DefaultMutableTreeNode) treePath.getLastPathComponent();
+                        WzObject thisObj = (WzObject) node.getUserObject();
+                        String thisPath = anchoredNodePath(node);
+
+                        Pair<WzObject, String> other = resolveOtherSide(otherPane, node);
+                        if (other == null) {
+                            MainFrame.getInstance().setStatusTextWithErrLog(MainFrame.i18n.get("diff.error.no_target", thisPath));
+                            ctx.addFailure(MainFrame.i18n.get("diff.error.no_target", thisPath));
+                            continue;
+                        }
+
+                        bindDiffRoots(otherPane, thisPath, other.getRight());
+                        WzDiffUtil.diffRoot(thisObj, other.getLeft(), thisPath, other.getRight(), ctx);
+                    }
+                } catch (Exception e) {
+                    log.error(e.getMessage());
+                    ctx.addFailure(e.getMessage());
+                }
+                return ctx;
+            }
+
+            @Override
+            protected void done() {
+                WzDiffUtil.DiffContext ctx;
+                try {
+                    ctx = get();
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex);
+                }
+                finishDiff(ctx, otherPane);
+            }
+        }.execute();
+    }
+
+    /**
+     * 与对侧视图当前选中的节点对比：不要求两侧文件名/路径一致，对比时把这两个节点绑定为对应关系，
+     * 后续的定位、表单视图值、替换都按此绑定映射
+     */
+    public void diffWithOtherPaneSelection() {
+        TreePath[] selectedPaths = tree.getSelectionPaths();
+        if (TreePathUtil.isNullOrMultiple(selectedPaths)) return;
+
+        EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+        TreePath otherSelected = otherPane.getTree().getSelectionPath();
+        if (otherSelected == null) {
+            MainFrame.getInstance().setStatusTextWithWarnLog(MainFrame.i18n.get("diff.error.no_selection"));
+            return;
+        }
+
+        DefaultMutableTreeNode thisNode = (DefaultMutableTreeNode) selectedPaths[0].getLastPathComponent();
+        DefaultMutableTreeNode otherNode = (DefaultMutableTreeNode) otherSelected.getLastPathComponent();
+        WzObject thisObj = (WzObject) thisNode.getUserObject();
+        WzObject otherObj = (WzObject) otherNode.getUserObject();
+        String thisPath = anchoredNodePath(thisNode);
+        String otherPath = otherPane.anchoredNodePath(otherNode);
+
+        clearDiffMarks();
+        otherPane.clearDiffMarks();
+        bindDiffRoots(otherPane, thisPath, otherPath);
+
+        new SwingWorker<WzDiffUtil.DiffContext, Void>() {
+            @Override
+            protected WzDiffUtil.DiffContext doInBackground() {
+                WzDiffUtil.DiffContext ctx = new WzDiffUtil.DiffContext(diffMarks, otherPane.getDiffMarks());
+                try {
+                    WzDiffUtil.diffRoot(thisObj, otherObj, thisPath, otherPath, ctx);
+                } catch (Exception e) {
+                    log.error(e.getMessage());
+                    ctx.addFailure(e.getMessage());
+                }
+                return ctx;
+            }
+
+            @Override
+            protected void done() {
+                WzDiffUtil.DiffContext ctx;
+                try {
+                    ctx = get();
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex);
+                }
+                finishDiff(ctx, otherPane);
+            }
+        }.execute();
+    }
+
+    /**
+     * 把两侧的对比根路径绑定为对应关系（双向）
+     */
+    private void bindDiffRoots(EditPane otherPane, String thisPath, String otherPath) {
+        diffBindings.put(thisPath, otherPath);
+        otherPane.diffBindings.put(otherPath, thisPath);
+    }
+
+    /**
+     * 对比完成后的公共收尾：展开差异路径、刷新着色、状态栏汇总、弹出结果列表
+     */
+    private void finishDiff(WzDiffUtil.DiffContext ctx, EditPane otherPane) {
+        List<DiffResult> results = ctx.getResults();
+        int revealed = 0;
+        int ghosts = 0;
+        for (DiffResult result : results) {
+            boolean withinReveal = revealed < MAX_DIFF_REVEAL;
+            if (withinReveal) {
+                revealed++;
+                if (result.thisPath() != null) revealDiffPath(result.thisPath());
+                if (result.otherPath() != null) otherPane.revealDiffPath(result.otherPath());
+            }
+            // 缺失的一侧插入半透明占位节点：MISSING 缺在本侧，ADDED 缺在对侧。
+            // 占位节点走独立上限，超出展开上限的只插入不强制展开
+            if (result.ghostPath() != null && ghosts < MAX_DIFF_GHOSTS) {
+                ghosts++;
+                if (result.kind() == DiffKind.MISSING) {
+                    insertGhostNode(result.ghostPath(), DiffKind.MISSING, withinReveal);
+                } else if (result.kind() == DiffKind.ADDED) {
+                    otherPane.insertGhostNode(result.ghostPath(), DiffKind.ADDED, withinReveal);
+                }
+            }
+        }
+
+        tree.repaint();
+        otherPane.getTree().repaint();
+
+        if (ctx.hasFailures()) {
+            // 有任务失败时结果不完整，不能报告"对比完成"或"两侧一致"
+            MainFrame.getInstance().setStatusTextWithErrLog(MainFrame.i18n.get("diff.status.failed", ctx.getFailures().size(), results.size()));
+            ctx.getFailures().forEach(failure -> log.error("对比失败: {}", failure));
+        } else if (results.isEmpty()) {
+            MainFrame.getInstance().setStatusText(MainFrame.i18n.get("diff.status.same"));
+        } else {
+            MainFrame.getInstance().setStatusText(MainFrame.i18n.get("diff.status.done", results.size()));
+        }
+
+        new CompareResultDialog(MainFrame.getInstance(), MainFrame.i18n.get("diff.dialog.title", results.size()),
+                results, this, otherPane).setVisible(true);
+    }
+
+    /**
+     * 清除视图对比的差异标记、节点绑定和占位节点
+     */
+    public void clearDiffMarks() {
+        diffMarks.clear();
+        diffBindings.clear();
+        for (DefaultMutableTreeNode ghostNode : ghostNodes) {
+            if (ghostNode.getParent() != null) {
+                treeModel.removeNodeFromParent(ghostNode);
+            }
+        }
+        ghostNodes.clear();
+        tree.repaint();
+    }
+
+    /**
+     * 在 path 位置插入一个半透明占位节点，提示"该节点对侧存在、本侧缺失"。不挂进数据模型，只影响树显示。
+     *
+     * @param show 是否把占位节点展开到可见（false 时只插入，等用户自己展开）
+     */
+    private void insertGhostNode(String path, DiffKind kind, boolean show) {
+        int slash = path.lastIndexOf('/');
+        if (slash <= 0) return; // 顶层节点缺失不做占位
+
+        DefaultMutableTreeNode parentNode = materializeDiffPath(path.substring(0, slash));
+        if (parentNode == null) return;
+
+        String name = path.substring(slash + 1);
+        if (findTreeNodeByName(parentNode, name) != null) return;
+
+        DiffGhostObject ghost = new DiffGhostObject(name);
+        diffMarks.put(ghost, kind);
+
+        DefaultMutableTreeNode ghostNode = new DefaultMutableTreeNode(ghost, false);
+        treeModel.insertNodeInto(ghostNode, parentNode, parentNode.getChildCount());
+        ghostNodes.add(ghostNode);
+        if (show) {
+            tree.makeVisible(new TreePath(ghostNode.getPath()));
+        }
+    }
+
+    /**
+     * 在对侧视图里定位到与选中节点同路径的文件/节点
+     */
+    public void locateInOtherPane() {
+        TreePath[] selectedPaths = tree.getSelectionPaths();
+        if (TreePathUtil.isNullOrMultiple(selectedPaths)) return;
+
+        DefaultMutableTreeNode node = (DefaultMutableTreeNode) selectedPaths[0].getLastPathComponent();
+        EditPane otherPane = MainFrame.getInstance().getCenterPane().getAnotherPane(this);
+
+        new SwingWorker<Pair<WzObject, String>, Void>() {
+            @Override
+            protected Pair<WzObject, String> doInBackground() {
+                return resolveOtherSide(otherPane, node);
+            }
+
+            @Override
+            protected void done() {
+                Pair<WzObject, String> other;
+                try {
+                    other = get();
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex);
+                }
+
+                if (other == null) {
+                    MainFrame.getInstance().setStatusTextWithErrLog(MainFrame.i18n.get("diff.error.no_target", anchoredNodePath(node)));
+                    return;
+                }
+
+                if (!MainFrame.getInstance().getCenterPane().isRightShowing()) {
+                    MainFrame.getInstance().getCenterPane().showRightEditPane(true);
+                }
+                otherPane.focusNodeByPath(other.getRight());
+            }
+        }.execute();
+    }
+
+    // 全部展开 / 全部收起 -------------------------------------------------------------------------------------------------
+    /**
+     * 递归展开选中节点的全部子孙（未解析的先解析）
+     */
+    public void expandAllFromSelection() {
+        TreePath[] selectedPaths = tree.getSelectionPaths();
+        if (selectedPaths == null) return;
+
+        for (TreePath treePath : selectedPaths) {
+            DefaultMutableTreeNode node = (DefaultMutableTreeNode) treePath.getLastPathComponent();
+            WzObject wzObject = (WzObject) node.getUserObject();
+            MainFrame.getInstance().setStatusText(MainFrame.i18n.get("status.loading", wzObject.getName()));
+
+            new SwingWorker<Void, Void>() {
+                @Override
+                protected Void doInBackground() {
+                    expandTreeNode(node, true, true, false);
+                    return null;
+                }
+
+                @Override
+                protected void done() {
+                    try {
+                        get();
+                    } catch (Exception ex) {
+                        throw new RuntimeException(ex);
+                    }
+                    expandAllNodes(node);
+                    MainFrame.getInstance().setStatusText(MainFrame.i18n.get("status.loaded", wzObject.getName()));
+                }
+            }.execute();
+        }
+    }
+
+    private void expandAllNodes(DefaultMutableTreeNode node) {
+        if (node.isLeaf()) {
+            expandTreeNode(node, true, true, false); // 子孙里可能还有未补插到树上的层级
+        }
+        if (node.isLeaf()) return;
+
+        tree.expandPath(new TreePath(node.getPath()));
+        for (int i = 0; i < node.getChildCount(); i++) {
+            expandAllNodes((DefaultMutableTreeNode) node.getChildAt(i));
+        }
+    }
+
+    /**
+     * 递归收起选中节点的全部子孙
+     */
+    public void collapseAllFromSelection() {
+        TreePath[] selectedPaths = tree.getSelectionPaths();
+        if (selectedPaths == null) return;
+
+        for (TreePath treePath : selectedPaths) {
+            collapseAll(treePath);
+        }
+    }
+
+    /**
+     * 只展开选中节点子树里带差异标记的分支（支持多选）。无标记的子树保持原样，数量可控不会卡
+     */
+    public void expandDiffFromSelection() {
+        TreePath[] selectedPaths = tree.getSelectionPaths();
+        if (selectedPaths == null) return;
+
+        for (TreePath treePath : selectedPaths) {
+            expandDiffNodes((DefaultMutableTreeNode) treePath.getLastPathComponent());
+        }
+    }
+
+    private void expandDiffNodes(DefaultMutableTreeNode node) {
+        if (!(node.getUserObject() instanceof WzObject obj)) return;
+        if (!diffMarks.containsKey(obj)) return; // 子树无差异，不展开
+
+        if (node.isLeaf()) {
+            expandTreeNode(node, true, true, false); // 补插已解析的子节点
+        }
+        if (node.isLeaf()) return;
+
+        tree.expandPath(new TreePath(node.getPath()));
+        for (int i = 0; i < node.getChildCount(); i++) {
+            expandDiffNodes((DefaultMutableTreeNode) node.getChildAt(i));
+        }
+    }
+
+    /**
+     * 阶梯修改 int：输入节点名、起始值、结束值，按树顺序把等分后的值依次写入各选中节点子树里的同名 int 节点
+     */
+    public void stepChangeIntNodeValue() {
+        TreePath[] selectedPaths = tree.getSelectionPaths();
+        if (selectedPaths == null) return;
+
+        StepIntDialog dialog = new StepIntDialog(MainFrame.i18n.get("tree.menu.step_int"), this);
+        StepIntFormData data = dialog.getData();
+        if (data == null) return;
+
+        // 按树里的显示顺序分配，而不是点选顺序
+        TreePath[] ordered = selectedPaths.clone();
+        java.util.Arrays.sort(ordered, java.util.Comparator.comparingInt(tree::getRowForPath));
+
+        int count = ordered.length;
+        for (int i = 0; i < count; i++) {
+            long value = count == 1
+                    ? data.getStart()
+                    : data.getStart() + Math.round((data.getEnd() - (long) data.getStart()) * i / (double) (count - 1));
+            DefaultMutableTreeNode node = (DefaultMutableTreeNode) ordered[i].getLastPathComponent();
+            WzObject root = (WzObject) node.getUserObject();
+            WzNodeUtil.changeIntNodeValue(root, data.getName(), (int) value);
+        }
+
+        tree.repaint();
+        MainFrame.getInstance().setStatusText(MainFrame.i18n.get("status.done"));
+    }
+
+    /**
+     * 把 path 对应的节点在树里补齐并展开到可见（不选中、不滚动），用于对比后批量展示差异位置。
+     * 节点对象已在对比时解析过，这里只做树节点的补插与展开。
+     */
+    private DefaultMutableTreeNode revealDiffPath(String path) {
+        DefaultMutableTreeNode node = materializeDiffPath(path);
+        if (node != null) {
+            tree.makeVisible(new TreePath(node.getPath()));
+        }
+        return node;
+    }
+
+    /**
+     * 只把 path 对应的树节点补插出来（不展开、不滚动）
+     */
+    private DefaultMutableTreeNode materializeDiffPath(String path) {
+        DefaultMutableTreeNode node = treeRoot;
+        for (String segment : path.split("/")) {
+            DefaultMutableTreeNode next = findTreeNodeByName(node, segment);
+            if (next == null && node.isLeaf() && node != treeRoot) {
+                expandTreeNode(node, true, true, false);
+                next = findTreeNodeByName(node, segment);
+            }
+            if (next == null) return null;
+            node = next;
+        }
+        return node;
+    }
+
+    /**
+     * 树锚定的完整路径：从树 Root 的直接子节点到 node 的名称链。
+     * <p>
+     * 与 {@code WzObject.getPath()} 不同：文件夹加载时每个 wz/img 的 getPath() 是独立路径空间（不含文件夹前缀），
+     * 这里按树的实际层级拼出完整路径。
+     */
+    private String anchoredNodePath(DefaultMutableTreeNode node) {
+        StringBuilder sb = new StringBuilder();
+        for (Object item : node.getUserObjectPath()) {
+            if (!(item instanceof WzObject obj)) continue; // 跳过 "root"
+            if (!sb.isEmpty()) sb.append("/");
+            sb.append(obj.getName());
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 在对侧面板解析与本侧选中节点对应的对象。
+     * <p>
+     * 两侧的文件夹层级可能不同（一侧直接加载 wz，另一侧从文件夹加载），因此：
+     * 先按完整树路径找；找不到时逐层剥掉本侧的文件夹前缀再找；
+     * 仍找不到则在对侧的文件夹树里搜出包含根段的文件夹，补上对侧前缀找。
+     *
+     * @return 对象与其在对侧的树锚定路径，找不到返回 null
+     */
+    private Pair<WzObject, String> resolveOtherSide(EditPane otherPane, DefaultMutableTreeNode node) {
+        // 绑定优先：节点落在某个已绑定的对比根下时，按绑定映射出对侧路径（两侧根路径可以完全不同）
+        String thisPath = anchoredNodePath(node);
+        String bindKey = null;
+        for (String key : diffBindings.keySet()) {
+            if ((thisPath.equals(key) || thisPath.startsWith(key + "/"))
+                    && (bindKey == null || key.length() > bindKey.length())) {
+                bindKey = key;
+            }
+        }
+        if (bindKey != null) {
+            String otherPath = diffBindings.get(bindKey) + thisPath.substring(bindKey.length());
+            WzObject obj = otherPane.findWzObjectByModelPath(otherPath);
+            if (obj != null) {
+                return new Pair<>(obj, otherPath);
+            }
+        }
+
+        List<WzObject> chain = new ArrayList<>();
+        for (Object item : node.getUserObjectPath()) {
+            if (item instanceof WzObject obj) chain.add(obj); // 跳过 "root"
+        }
+
+        List<String> segments = new ArrayList<>();
+        chain.forEach(obj -> segments.add(obj.getName()));
+
+        // 可剥离的文件夹前缀层数：链上开头连续的文件夹，选中节点本身不算
+        int folderPrefixCount = 0;
+        while (folderPrefixCount < chain.size() - 1 && chain.get(folderPrefixCount) instanceof WzFolder) {
+            folderPrefixCount++;
+        }
+
+        for (int strip = 0; strip <= folderPrefixCount; strip++) {
+            String candidate = String.join("/", segments.subList(strip, segments.size()));
+            WzObject obj = otherPane.findWzObjectByModelPath(candidate);
+            if (obj != null) {
+                return new Pair<>(obj, candidate);
+            }
+        }
+
+        // 对侧比本侧多了文件夹层级：在对侧的文件夹里递归找根段所在的文件夹
+        String candidate = String.join("/", segments.subList(folderPrefixCount, segments.size()));
+        String prefix = otherPane.findFolderPrefixContaining(segments.get(folderPrefixCount));
+        if (prefix != null) {
+            String full = prefix + "/" + candidate;
+            WzObject obj = otherPane.findWzObjectByModelPath(full);
+            if (obj != null) {
+                return new Pair<>(obj, full);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 在本面板已加载的文件夹树里递归查找直接包含 name 子项的文件夹，返回其树锚定路径
+     */
+    private String findFolderPrefixContaining(String name) {
+        for (int i = 0; i < treeRoot.getChildCount(); i++) {
+            if (((DefaultMutableTreeNode) treeRoot.getChildAt(i)).getUserObject() instanceof WzFolder folder) {
+                String result = searchFolderPrefix(folder, folder.getName(), name);
+                if (result != null) return result;
+            }
+        }
+        return null;
+    }
+
+    private String searchFolderPrefix(WzFolder folder, String prefix, String name) {
+        for (WzObject child : folder.getChildren()) {
+            if (child.getName().equals(name)) return prefix;
+        }
+        for (WzObject child : folder.getChildren()) {
+            if (child instanceof WzFolder sub) {
+                String result = searchFolderPrefix(sub, prefix + "/" + sub.getName(), name);
+                if (result != null) return result;
+            }
+        }
+        return null;
     }
 
     // 批量修改图片格式 ---------------------------------------------------------------------------------------------------

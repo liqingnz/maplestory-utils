@@ -15,6 +15,11 @@ public final class WzDirectoryMenu extends TreeMenu {
         add(btnImgFinder);
         add(btnImport);
         add(btnImgCompare);
+        add(btnDiff);
+        add(btnDiffWithSelection);
+        add(btnLocateInView);
+        add(btnExpandDiff);
+        add(btnCollapseAll);
         add(btnDelNonCashEqp);
     }
 

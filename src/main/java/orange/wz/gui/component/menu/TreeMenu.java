@@ -25,6 +25,13 @@ public class TreeMenu extends JPopupMenu {
     protected JMenuItem btnCopy;
     protected JMenuItem btnLocalize;
     protected JMenuItem btnImgCompare;
+    protected JMenuItem btnDiff;
+    protected JMenuItem btnDiffWithSelection;
+    protected JMenuItem btnLocateInView;
+    protected JMenuItem btnExpandAll;
+    protected JMenuItem btnCollapseAll;
+    protected JMenuItem btnExpandDiff;
+    protected JMenuItem btnStepInt;
     protected JMenuItem btnOutlink;
     protected JMenuItem btnImgFinder;
     protected JMenuItem btnDelNonCashEqp;
@@ -97,6 +104,27 @@ public class TreeMenu extends JPopupMenu {
 
         btnImgCompare = new JMenuItem(MainFrame.i18n.get("tree.menu.img_compare"));
         btnImgCompare.addActionListener(e -> editPane.compareImg());
+
+        btnDiff = new JMenuItem(MainFrame.i18n.get("tree.menu.diff"));
+        btnDiff.addActionListener(e -> editPane.diffWithOtherPane());
+
+        btnDiffWithSelection = new JMenuItem(MainFrame.i18n.get("tree.menu.diff_with_selection"));
+        btnDiffWithSelection.addActionListener(e -> editPane.diffWithOtherPaneSelection());
+
+        btnLocateInView = new JMenuItem(MainFrame.i18n.get("tree.menu.locate_view"), AiOutlineEye);
+        btnLocateInView.addActionListener(e -> editPane.locateInOtherPane());
+
+        btnExpandAll = new JMenuItem(MainFrame.i18n.get("tree.menu.expand_all"));
+        btnExpandAll.addActionListener(e -> editPane.expandAllFromSelection());
+
+        btnCollapseAll = new JMenuItem(MainFrame.i18n.get("tree.menu.collapse_all"));
+        btnCollapseAll.addActionListener(e -> editPane.collapseAllFromSelection());
+
+        btnExpandDiff = new JMenuItem(MainFrame.i18n.get("tree.menu.expand_diff"));
+        btnExpandDiff.addActionListener(e -> editPane.expandDiffFromSelection());
+
+        btnStepInt = new JMenuItem(MainFrame.i18n.get("tree.menu.step_int"));
+        btnStepInt.addActionListener(e -> editPane.stepChangeIntNodeValue());
 
         btnOutlink = new JMenuItem(MainFrame.i18n.get("tree.menu.outlink"));
         btnOutlink.addActionListener(e -> editPane.outlink());

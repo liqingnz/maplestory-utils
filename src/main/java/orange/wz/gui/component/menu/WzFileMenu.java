@@ -20,6 +20,11 @@ public final class WzFileMenu extends TreeMenu {
         add(btnImport);
         add(btnLocalize);
         add(btnImgCompare);
+        add(btnDiff);
+        add(btnDiffWithSelection);
+        add(btnLocateInView);
+        add(btnExpandDiff);
+        add(btnCollapseAll);
         add(btnOutlink);
     }
 

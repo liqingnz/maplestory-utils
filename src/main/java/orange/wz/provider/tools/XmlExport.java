@@ -91,6 +91,7 @@ public final class XmlExport {
             image.getChildren().forEach(prop -> writeProp(prop, ""));
             curIndent--;
             writer.write("</imgdir>");
+            writer.write(linux ? "\n" : "\r\n"); // 文件末尾保留换行，和常见工具产物一致，避免 diff 出现 \ No newline at end of file
             writer.flush();
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -105,9 +106,11 @@ public final class XmlExport {
             switch (property) {
                 case WzCanvasProperty prop -> {
                     String etName = escapeText(prop.getName());
-                    String format = String.valueOf(prop.getFormat().getValue());
-                    String scale = String.valueOf(prop.getScale());
-                    String context = "<canvas name=\"" + etName + "\" format=\"" + format + "\" scale=\"" + scale + "\"";
+                    String context = "<canvas name=\"" + etName + "\" width=\"" + prop.getWidth() + "\" height=\"" + prop.getHeight() + "\"";
+                    // NONE 模式下导入端会整个丢弃 canvas，format/scale 是死数据，不写，保持和常见 wz-xml dump 一致
+                    if (meType != MediaExportType.NONE) {
+                        context += " format=\"" + prop.getFormat().getValue() + "\" scale=\"" + prop.getScale() + "\"";
+                    }
 
                     if (meType == MediaExportType.BASE64)
                         context = context + " basedata=\"" + Base64Tool.coverBytesToBase64(prop.getImageBytes(false)) + "\"";
@@ -206,6 +209,9 @@ public final class XmlExport {
                         String filename = FileTool.safeFileName(mediaFilename + prop.getName() + ".mp3");
                         Path p = mediaFolder.resolve(filename);
                         FileTool.saveFile(p, prop.getSoundBytes(false));
+                    } else {
+                        // NONE 模式不写音频数据，但标签必须闭合，否则导出的 xml 不合法
+                        context = context + " length=\"" + prop.getLenMs() + "\"/>";
                     }
 
                     writer.write(context);

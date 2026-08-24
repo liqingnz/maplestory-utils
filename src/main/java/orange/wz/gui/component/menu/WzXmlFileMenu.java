@@ -24,6 +24,12 @@ public final class WzXmlFileMenu extends TreeMenu {
         add(btnPaste);
         add(btnExport);
         add(btnImgCompare);
+        add(btnDiff);
+        add(btnDiffWithSelection);
+        add(btnLocateInView);
+        add(btnExpandAll);
+        add(btnCollapseAll);
+        add(btnExpandDiff);
         add(btnImgFinder);
         add(btnOrderAndRename);
         add(btnDelChild);
@@ -31,6 +37,7 @@ public final class WzXmlFileMenu extends TreeMenu {
         add(btnScaleImg);
         add(btnChangeNodeName);
         add(btnChangeIntNodeValue);
+        add(btnStepInt);
         add(btnRawToIcon);
         add(btnChangeCavOrigin);
     }

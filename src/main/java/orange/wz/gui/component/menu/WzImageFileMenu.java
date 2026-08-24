@@ -27,6 +27,12 @@ public final class WzImageFileMenu extends TreeMenu {
         add(btnExport);
         add(btnLocalize);
         add(btnImgCompare);
+        add(btnDiff);
+        add(btnDiffWithSelection);
+        add(btnLocateInView);
+        add(btnExpandAll);
+        add(btnCollapseAll);
+        add(btnExpandDiff);
         add(btnImgFinder);
         add(btnOrderAndRename);
         add(btnDelChild);
@@ -34,6 +40,7 @@ public final class WzImageFileMenu extends TreeMenu {
         add(btnScaleImg);
         add(btnChangeNodeName);
         add(btnChangeIntNodeValue);
+        add(btnStepInt);
         add(btnRawToIcon);
         add(btnChangeCavOrigin);
     }

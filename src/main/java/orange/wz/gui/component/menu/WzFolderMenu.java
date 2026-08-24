@@ -42,6 +42,11 @@ public final class WzFolderMenu extends TreeMenu {
         add(btnMoveView);
         add(btnChangeKey);
         add(btnExport);
+        add(btnDiff);
+        add(btnDiffWithSelection);
+        add(btnLocateInView);
+        add(btnExpandDiff);
+        add(btnCollapseAll);
         add(btnLoadAll);
     }
 

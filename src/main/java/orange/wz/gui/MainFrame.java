@@ -59,7 +59,7 @@ public class MainFrame extends JFrame {
     /**
      * 默认预览开关，开启后选中节点时会在右边展示它的下一级
      */
-    private boolean defaultPreview;
+    private boolean defaultPreview = true;
 
     /**
      * Character 预览开关，开启后选中 img 时会额外展示它的 info 节点
@@ -161,10 +161,13 @@ public class MainFrame extends JFrame {
         view.setIcon(AiOutlineEye);
         viewShow = new JMenuItem(i18n.get("menu.tool.show"));
         JMenuItem viewSync = new JMenuItem(i18n.get("menu.tool.disableSync"));
+        JMenuItem viewClearDiff = new JMenuItem(i18n.get("menu.tool.clearDiff"));
         view.add(viewShow);
         view.add(viewSync);
+        view.add(viewClearDiff);
 
         JCheckBoxMenuItem defaultPreviewMenu = new JCheckBoxMenuItem(i18n.get("menu.tool.defaultPreview"));
+        defaultPreviewMenu.setSelected(defaultPreview);
         defaultPreviewMenu.addActionListener(e -> {
             defaultPreview = defaultPreviewMenu.isSelected();
             refreshSelection();
@@ -224,6 +227,10 @@ public class MainFrame extends JFrame {
         });
         viewShow.addActionListener(e -> {
             centerPane.showRightEditPane(!centerPane.isRightShowing());
+        });
+        viewClearDiff.addActionListener(e -> {
+            centerPane.getLeftEditPane().clearDiffMarks();
+            centerPane.getRightEditPane().clearDiffMarks();
         });
         viewSync.addActionListener(e -> {
             if (centerPane.isSync()) {

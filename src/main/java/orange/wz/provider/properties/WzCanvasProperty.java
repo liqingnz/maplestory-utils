@@ -45,6 +45,10 @@ public class WzCanvasProperty extends WzExtended {
         return png.getImage(saveInMem);
     }
 
+    public byte[] getCompressedBytes(boolean saveInMem) {
+        return png.getCompressedBytes(saveInMem);
+    }
+
     public void initPngProperty(String name, WzObject parent, WzImage wzImage) {
         png = new WzPngProperty(name, parent, wzImage);
     }
@@ -66,6 +70,20 @@ public class WzCanvasProperty extends WzExtended {
 
     public void clearImage() {
         png.clearImage();
+    }
+
+    /**
+     * 图片数据能否在清掉解码缓存后重新取回，见 {@link WzPngProperty#isImageRecoverable()}
+     */
+    public boolean isImageRecoverable() {
+        return png.isImageRecoverable();
+    }
+
+    /**
+     * 只在图片可以重新取回时才释放解码缓存（内存里唯一的图片数据不会被清掉）
+     */
+    public void clearImageIfRecoverable() {
+        png.clearImageIfRecoverable();
     }
 
     public void clearPngProperty() {

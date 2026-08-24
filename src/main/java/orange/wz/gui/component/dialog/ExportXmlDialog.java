@@ -27,13 +27,14 @@ public final class ExportXmlDialog extends BaseDialog<ExportXmlData> {
         indentField.setText("2");
         JButton selectBtn = new JButton(MainFrame.i18n.get("test.temp0092"));
         selectBtn.setSelected(false);
-        selectBtn.addActionListener(e -> {
-            File folder = FileDialog.chooseOpenFolder(MainFrame.i18n.get("test.temp0093"));
-            if (folder == null) return;
-
-            pathField.setText(folder.getAbsolutePath());
-        });
+        selectBtn.addActionListener(e -> chooseExportFolder());
         pathField.setEditable(false);
+
+        // 预填上次的导出路径（和导入路径分开记忆）
+        String lastExportDir = FileDialog.getLastDir(FileDialog.KEY_EXPORT);
+        if (lastExportDir != null) {
+            pathField.setText(lastExportDir);
+        }
 
         addRow(MainFrame.i18n.get("test.temp0094"), indentField);
         // 创建互斥单选集合
@@ -69,13 +70,32 @@ public final class ExportXmlDialog extends BaseDialog<ExportXmlData> {
         addRow(MainFrame.i18n.get("test.temp0096"), pathField, selectBtn);
     }
 
+    /**
+     * 选择导出目录，选定后写入输入框并记住路径
+     *
+     * @return 是否选定
+     */
+    private boolean chooseExportFolder() {
+        File folder = FileDialog.chooseOpenFolder(MainFrame.i18n.get("test.temp0093"), FileDialog.KEY_EXPORT);
+        if (folder == null) return false;
+
+        pathField.setText(folder.getAbsolutePath());
+        return true;
+    }
+
     @Override
     public ExportXmlData getData() {
         if (showDialog() != JOptionPane.OK_OPTION) {
             return null;
         }
 
-        if (pathField.getText().isBlank()) return null;
+        // 没有选路径就直接确定时，补弹一次目录选择，避免点了确定什么都没发生
+        if (pathField.getText().isBlank() && !chooseExportFolder()) {
+            MainFrame.getInstance().setStatusTextWithWarnLog(MainFrame.i18n.get("export.no_path"));
+            return null;
+        }
+
+        FileDialog.rememberDir(FileDialog.KEY_EXPORT, new File(pathField.getText()));
 
         int indent;
         try {

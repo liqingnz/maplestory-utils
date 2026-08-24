@@ -189,6 +189,24 @@ public class WzPngProperty extends WzImageProperty {
         image = null;
     }
 
+    /**
+     * 解码后的图片能否在清掉之后重新取回：已缓存压缩数据，或能按 offset 从原文件重新读取。
+     * <p>
+     * 只存在于内存里的图片（XML 导入、新建、尚未写入 wz）两者都没有，清掉就永久丢失了。
+     */
+    public boolean isImageRecoverable() {
+        return compressedBytes != null || offset != 0;
+    }
+
+    /**
+     * 只在图片可以重新取回时才释放解码缓存，用于遍历大量图片后回收内存
+     */
+    public void clearImageIfRecoverable() {
+        if (isImageRecoverable()) {
+            image = null;
+        }
+    }
+
     // Getter ----------------------------------------------------------------------------------------------------------
     public BufferedImage getImage(boolean saveInMem) {
         if (image == null) {
