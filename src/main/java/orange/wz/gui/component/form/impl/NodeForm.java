@@ -51,38 +51,40 @@ public class NodeForm extends AbstractValueForm {
 
     public void setData(String name, String type, WzObject wzObject, EditPane editPane) {
         super.setData(name, type, wzObject, editPane);
-        // 默认不展示预览，需要预览的节点会在之后单独调用 setImageInfo / setChildrenPreview
+        // 默认不展示预览，需要预览的节点会在之后单独调用 setInfoPreview / setChildrenPreview
         clearPreview();
     }
 
     /**
-     * 尝试解析 img 下的 info 节点，把它的直接子节点展示到名称/类型的下方
+     * 找节点下的 info 子节点，img 会先解析；没有 info 时返回 null
      *
-     * @param wzImage 目标 img，为 null 时只清空
+     * @param wzObject 目标节点
      */
-    public void setImageInfo(WzImage wzImage) {
+    public static WzImageProperty findInfo(WzObject wzObject) {
+        return switch (wzObject) {
+            // img 的子节点要先解析出来
+            case WzImage image -> parse(image) ? image.getChild("info") : null;
+            // 值节点的 children 是 null，只有 List 类型的节点才能取子节点
+            case WzImageProperty property -> property.isListProperty() ? property.getChild("info") : null;
+            case null, default -> null;
+        };
+    }
+
+    /**
+     * info 预览：把 info 节点的直接子节点展示到名称/类型的下方
+     *
+     * @param info 目标节点下的 info 节点，为 null 时只清空
+     */
+    public void setInfoPreview(WzImageProperty info) {
         clearPreview();
-        if (wzImage == null) return;
+        if (info == null) return;
 
-        setPreviewTitle(MainFrame.i18n.get("form.character.info"));
-
-        if (!parse(wzImage)) {
-            addHintRow(MainFrame.i18n.get("form.character.parse_failed", wzImage.getStatus().getMessage()));
-            showPreview();
-            return;
-        }
-
-        WzImageProperty info = wzImage.getChild("info");
-        if (info == null) {
-            addHintRow(MainFrame.i18n.get("form.character.no_info"));
-            showPreview();
-            return;
-        }
+        setPreviewTitle(MainFrame.i18n.get("form.preview.info"));
 
         // 值节点的 children 是 null，只有 List 类型的节点才能取子节点
         List<WzImageProperty> children = info.isListProperty() ? info.getChildren() : List.of();
         if (children.isEmpty()) {
-            addHintRow(MainFrame.i18n.get("form.character.empty_info"));
+            addHintRow(MainFrame.i18n.get("form.preview.empty_info"));
         } else {
             addPropertyRows(children);
         }
@@ -106,7 +108,7 @@ public class NodeForm extends AbstractValueForm {
             case WzImage image -> {
                 // img 的子节点要先解析出来
                 if (!parse(image)) {
-                    addHintRow(MainFrame.i18n.get("form.character.parse_failed", image.getStatus().getMessage()));
+                    addHintRow(MainFrame.i18n.get("form.preview.parse_failed", image.getStatus().getMessage()));
                     showPreview();
                     return;
                 }
@@ -135,7 +137,7 @@ public class NodeForm extends AbstractValueForm {
         return new NodeFormData(nameInput.getText(), typeInput.getText());
     }
 
-    private boolean parse(WzImage wzImage) {
+    private static boolean parse(WzImage wzImage) {
         try {
             return wzImage.parse();
         } catch (Exception e) {
@@ -286,10 +288,10 @@ public class NodeForm extends AbstractValueForm {
             case WzUOLProperty p -> readOnlyField(p.getValue());
             case WzLuaProperty p -> readOnlyField(p.getString());
             case WzVectorProperty p -> readOnlyField(p.getX() + ", " + p.getY());
-            case WzSoundProperty p -> readOnlyField(MainFrame.i18n.get("form.character.sound", p.getLenMs()));
-            case WzRawDataProperty p -> readOnlyField(MainFrame.i18n.get("form.character.raw", p.getLength()));
-            case WzListProperty p -> readOnlyField(MainFrame.i18n.get("form.character.list", p.getChildren().size()));
-            case WzConvexProperty p -> readOnlyField(MainFrame.i18n.get("form.character.list", p.getChildren().size()));
+            case WzSoundProperty p -> readOnlyField(MainFrame.i18n.get("form.preview.sound", p.getLenMs()));
+            case WzRawDataProperty p -> readOnlyField(MainFrame.i18n.get("form.preview.raw", p.getLength()));
+            case WzListProperty p -> readOnlyField(MainFrame.i18n.get("form.preview.list", p.getChildren().size()));
+            case WzConvexProperty p -> readOnlyField(MainFrame.i18n.get("form.preview.list", p.getChildren().size()));
             case WzNullProperty ignored -> readOnlyField("");
             default -> readOnlyField(property.getType().name());
         };
@@ -309,13 +311,13 @@ public class NodeForm extends AbstractValueForm {
                 label.setMinimumSize(box);
 
                 label.setBorder(BorderFactory.createLineBorder(Color.GRAY));
-                label.setToolTipText(MainFrame.i18n.get("form.character.canvas", canvas.getWidth(), canvas.getHeight()));
+                label.setToolTipText(MainFrame.i18n.get("form.preview.canvas", canvas.getWidth(), canvas.getHeight()));
                 return label;
             }
         } catch (Exception e) {
             log.error("解析图片失败: {}", canvas.getPath(), e);
         }
-        return readOnlyField(MainFrame.i18n.get("form.character.decode_failed"));
+        return readOnlyField(MainFrame.i18n.get("form.preview.decode_failed"));
     }
 
     /**

@@ -34,7 +34,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -461,6 +460,20 @@ public final class EditPane extends JSplitPane {
     }
 
     /**
+     * 节点预览：开了 info 预览且节点下有 info 时展示 info 的内容，否则回到默认预览
+     */
+    private void previewNode(WzObject wzObject) {
+        if (MainFrame.getInstance().isInfoPreview()) {
+            WzImageProperty info = NodeForm.findInfo(wzObject);
+            if (info != null) {
+                getNodeForm().setInfoPreview(info);
+                return;
+            }
+        }
+        previewChildren(wzObject);
+    }
+
+    /**
      * node 单击事件
      */
     private void handleTreeClick(DefaultMutableTreeNode node) {
@@ -500,11 +513,7 @@ public final class EditPane extends JSplitPane {
             }
             case WzImage obj -> {
                 getNodeForm().setData(obj.getName(), WzType.IMAGE.name(), wzObject, this);
-                if (MainFrame.getInstance().isCharacterPreview()) {
-                    getNodeForm().setImageInfo(obj);
-                } else {
-                    previewChildren(obj);
-                }
+                previewNode(obj);
                 switchForm("node");
             }
             case WzCanvasProperty obj -> {
@@ -513,7 +522,7 @@ public final class EditPane extends JSplitPane {
             }
             case WzConvexProperty obj -> {
                 getNodeForm().setData(obj.getName(), WzType.CONVEX_PROPERTY.name(), wzObject, this);
-                previewChildren(obj);
+                previewNode(obj);
                 switchForm("node");
             }
             case WzDoubleProperty obj -> {
@@ -530,7 +539,7 @@ public final class EditPane extends JSplitPane {
             }
             case WzListProperty obj -> {
                 getNodeForm().setData(obj.getName(), WzType.LIST_PROPERTY.name(), wzObject, this);
-                previewChildren(obj);
+                previewNode(obj);
                 switchForm("node");
             }
             case WzLongProperty obj -> {
@@ -907,8 +916,9 @@ public final class EditPane extends JSplitPane {
         SwingWorker<Void, Void> worker = new SwingWorker<>() {
             @Override
             protected Void doInBackground() {
+                // 解析留在后台线程，expandTreeNode 内部会把补插节点的部分切回 EDT
                 expandTreeNode(node, true, true, false);
-                tree.expandPath(new TreePath(node.getPath()));
+                EdtUtil.run(() -> tree.expandPath(new TreePath(node.getPath())));
                 return null;
             }
 
@@ -943,23 +953,24 @@ public final class EditPane extends JSplitPane {
             case WzFolder folder -> {
                 List<WzObject> children = folder.getChildren();
                 WzTool.sortWzObjects(children);
-                children.forEach(child -> insertNodeToTree(node, child, expand));
+                // 整棵子树一次切到 EDT 上插完，别逐个节点来回切线程
+                EdtUtil.run(() -> children.forEach(child -> insertNodeToTree(node, child, expand)));
             }
             case WzDirectory wzDir -> {
                 if (wzDir.isWzFile() && parseWz && !wzDir.getWzFile().parse()) {
                     MainFrame.getInstance().setStatusTextWithErrLog(MainFrame.i18n.get("error.parse", wzDir.getName(), wzDir.getWzFile().getStatus().getMessage()));
                     throw new RuntimeException();
                 }
-                addChildrenRecursively(node, wzDir, expand);
+                EdtUtil.run(() -> addChildrenRecursively(node, wzDir, expand));
             }
             case WzImage wzImg -> {
                 if (parseImg && !wzImg.parse()) {
                     MainFrame.getInstance().setStatusTextWithErrLog(MainFrame.i18n.get("error.parse", wzImg.getName(), wzImg.getStatus().getMessage()));
                     throw new RuntimeException();
                 }
-                addChildrenRecursively(node, wzImg, expand);
+                EdtUtil.run(() -> addChildrenRecursively(node, wzImg, expand));
             }
-            case WzImageProperty property -> addChildrenRecursively(node, property, expand); // 粘贴后的 List 节点
+            case WzImageProperty property -> EdtUtil.run(() -> addChildrenRecursively(node, property, expand)); // 粘贴后的 List 节点
             default -> {
             }
         }
@@ -1277,14 +1288,16 @@ public final class EditPane extends JSplitPane {
      * @return 插入后生成的新 Node
      */
     public DefaultMutableTreeNode insertNodeToTree(DefaultMutableTreeNode parentNode, WzObject object, boolean expand, int index) {
-        DefaultMutableTreeNode newNode = new DefaultMutableTreeNode(object);
-        treeModel.insertNodeInto(newNode, parentNode, index == -1 ? parentNode.getChildCount() : index);
+        return EdtUtil.call(() -> {
+            DefaultMutableTreeNode newNode = new DefaultMutableTreeNode(object);
+            treeModel.insertNodeInto(newNode, parentNode, index == -1 ? parentNode.getChildCount() : index);
 
-        if (expand) {
-            tree.expandPath(new TreePath(parentNode.getPath()));
-        }
+            if (expand) {
+                tree.expandPath(new TreePath(parentNode.getPath()));
+            }
 
-        return newNode;
+            return newNode;
+        });
     }
 
     /**
@@ -1296,12 +1309,24 @@ public final class EditPane extends JSplitPane {
         if (node == null) return;
         if (node.getParent() == null) return;
 
+        EdtUtil.run(() -> {
+            // 必须先从模型里摘掉再断引用：反过来做的话，中间这段时间渲染器会拿到 userObject 为 null 的节点，
+            // 那一片行就画成空白了
+            treeModel.removeNodeFromParent(node);
+            detachSubtree(node);
+        });
+    }
+
+    /**
+     * 递归断开子树对 WzObject 的引用，帮助 GC 回收已卸载的节点
+     *
+     * @param node 已经从树模型里摘掉的节点
+     */
+    private void detachSubtree(DefaultMutableTreeNode node) {
         for (int i = 0; i < node.getChildCount(); i++) {
-            DefaultMutableTreeNode child = (DefaultMutableTreeNode) node.getChildAt(i);
-            removeNodeFromTree(child);
+            detachSubtree((DefaultMutableTreeNode) node.getChildAt(i));
         }
         node.setUserObject(null);
-        treeModel.removeNodeFromParent(node);
     }
 
     /**
@@ -1461,7 +1486,7 @@ public final class EditPane extends JSplitPane {
                 continue;
             }
             if (node.isLeaf()) {
-                waitForWorker(handleTreeDoubleClick(node));
+                expandNodeNow(node);
             } else {
                 tree.expandPath(new TreePath(node.getPath()));
             }
@@ -1531,7 +1556,7 @@ public final class EditPane extends JSplitPane {
             if (isLast) {
                 if (expandTarget) {
                     if (node.isLeaf()) {
-                        waitForWorker(handleTreeDoubleClick(node));
+                        expandNodeNow(node);
                     } else {
                         tree.expandPath(treePath);
                     }
@@ -1546,7 +1571,7 @@ public final class EditPane extends JSplitPane {
             }
 
             if (node.isLeaf()) {
-                waitForWorker(handleTreeDoubleClick(node));
+                expandNodeNow(node);
             } else {
                 tree.expandPath(treePath);
             }
@@ -1554,12 +1579,17 @@ public final class EditPane extends JSplitPane {
         return true;
     }
 
-    private void waitForWorker(SwingWorker<Void, Void> worker) {
-        try {
-            worker.get();
-        } catch (ExecutionException | InterruptedException e) {
-            throw new RuntimeException(e);
-        }
+    /**
+     * 同步展开节点：解析和补插子节点都在当前线程上做完
+     * <p>
+     * 不能用 handleTreeDoubleClick 那个后台 worker 再 get() 等它 —— 在 EDT 上等会和 worker 抢 EDT 直接死锁，
+     * 在后台线程上等则会占着 SwingWorker 线程池的线程，等的人多了整个池子就饿死了
+     *
+     * @param node 要展开的节点
+     */
+    private void expandNodeNow(DefaultMutableTreeNode node) {
+        expandTreeNode(node, true, true, false);
+        EdtUtil.run(() -> tree.expandPath(new TreePath(node.getPath())));
     }
 
     private DefaultMutableTreeNode findRootTreeNode(String path) {
@@ -1637,6 +1667,11 @@ public final class EditPane extends JSplitPane {
     }
 
     private void reloadFilePreservingState(DefaultMutableTreeNode node, WzKey key) {
+        // 快照展开状态、换掉整棵子树、再恢复展开和选中，中途被 EDT 画一次就会花，所以整段放在 EDT 上一次做完
+        EdtUtil.run(() -> doReloadFilePreservingState(node, key));
+    }
+
+    private void doReloadFilePreservingState(DefaultMutableTreeNode node, WzKey key) {
         String rootPath = getNodePath(node);
         if (rootPath == null) {
             return;
@@ -1899,8 +1934,10 @@ public final class EditPane extends JSplitPane {
      * 重置编辑框，避免编辑框里的 WzObject 占着已卸载的对象，无法释放内存
      */
     public void resetValueForm() {
-        getNodeForm().setData("", "", null, this);
-        switchForm("node");
+        EdtUtil.run(() -> {
+            getNodeForm().setData("", "", null, this);
+            switchForm("node");
+        });
     }
 
     private void clear() {
@@ -2012,6 +2049,33 @@ public final class EditPane extends JSplitPane {
         files.stream()
                 .filter(File::isDirectory)
                 .forEach(RecentFolderUtil::add);
+    }
+
+    /**
+     * 树里第一层节点对应的磁盘路径，用于记忆布局
+     * <p>
+     * 新建但还没保存过的 wz / img 没有磁盘文件，会被跳过
+     *
+     * @return 路径列表，顺序和树里一致
+     */
+    public List<String> getLoadedFilePaths() {
+        List<String> paths = new ArrayList<>();
+
+        for (int i = 0; i < treeRoot.getChildCount(); i++) {
+            WzObject wzObject = (WzObject) ((DefaultMutableTreeNode) treeRoot.getChildAt(i)).getUserObject();
+
+            switch (wzObject) {
+                case WzFolder folder -> paths.add(folder.getFilePath());
+                case WzDirectory wzDir when wzDir.isWzFile() && !wzDir.getWzFile().isNewFile() ->
+                        paths.add(wzDir.getWzFile().getFilePath());
+                case WzImageFile img when !img.isNewFile() -> paths.add(img.getFilePath());
+                case WzXmlFile xml -> paths.add(xml.getFilePath());
+                default -> {
+                }
+            }
+        }
+
+        return paths;
     }
 
     // 重载 -------------------------------------------------------------------------------------------------------------
@@ -2177,8 +2241,13 @@ public final class EditPane extends JSplitPane {
      * @param node WzFolder 对应的节点
      */
     private void saveWzFolder(DefaultMutableTreeNode node) {
+        // 保存完会重载节点（旧节点被换掉），先把子节点抄一份再遍历，避免边存边改索引对不上
+        List<DefaultMutableTreeNode> children = new ArrayList<>();
         for (int i = 0; i < node.getChildCount(); i++) {
-            DefaultMutableTreeNode child = (DefaultMutableTreeNode) node.getChildAt(i);
+            children.add((DefaultMutableTreeNode) node.getChildAt(i));
+        }
+
+        for (DefaultMutableTreeNode child : children) {
             WzObject wzObject = (WzObject) child.getUserObject();
             if (wzObject instanceof WzFolder) {
                 saveWzFolder(child);

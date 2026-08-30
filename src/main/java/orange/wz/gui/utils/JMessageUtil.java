@@ -16,12 +16,13 @@ public final class JMessageUtil {
     }
 
     public static void info(Component parent, String title, String message) {
-        JOptionPane.showMessageDialog(
+        // 后台线程弹模态框会挡住主窗口却不走 EDT 的事件泵，看着就是界面死了，统一切回 EDT
+        EdtUtil.run(() -> JOptionPane.showMessageDialog(
                 parent,
                 message,
                 title,
                 JOptionPane.INFORMATION_MESSAGE
-        );
+        ));
     }
 
     public static void warn(String message) {
@@ -33,12 +34,12 @@ public final class JMessageUtil {
     }
 
     public static void warn(Component parent, String title, String message) {
-        JOptionPane.showMessageDialog(
+        EdtUtil.run(() -> JOptionPane.showMessageDialog(
                 parent,
                 message,
                 title,
                 JOptionPane.WARNING_MESSAGE
-        );
+        ));
     }
 
     public static void error(String message) {
@@ -50,11 +51,11 @@ public final class JMessageUtil {
     }
 
     public static void error(Component parent, String title, String message) {
-        JOptionPane.showMessageDialog(
+        EdtUtil.run(() -> JOptionPane.showMessageDialog(
                 parent,
                 message,
                 title,
                 JOptionPane.ERROR_MESSAGE
-        );
+        ));
     }
 }

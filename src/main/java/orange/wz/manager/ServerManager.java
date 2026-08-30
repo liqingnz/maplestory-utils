@@ -5,6 +5,7 @@ import lombok.Getter;
 import lombok.NonNull;
 import orange.wz.gui.Icons;
 import orange.wz.gui.MainFrame;
+import orange.wz.gui.utils.EdtExceptionGuard;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.annotation.Value;
@@ -57,6 +58,8 @@ public class ServerManager implements ApplicationContextAware, ApplicationRunner
     @Override
     public void run(@Nullable ApplicationArguments args) {
         SwingUtilities.invokeLater(() -> {
+            EdtExceptionGuard.install();
+
             MainFrame frame = MainFrame.getInstance();
             frame.setIconImages(List.of(Objects.requireNonNull(Icons.loadImage("logo512.png"))));
             frame.setVisible(true);

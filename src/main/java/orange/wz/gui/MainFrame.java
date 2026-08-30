@@ -12,6 +12,8 @@ import orange.wz.gui.component.form.impl.CanvasForm;
 import orange.wz.gui.component.key.KeyBox;
 import orange.wz.gui.component.key.KeyManager;
 import orange.wz.gui.component.panel.CenterPane;
+import orange.wz.gui.utils.EdtUtil;
+import orange.wz.gui.utils.LayoutUtil;
 import orange.wz.gui.utils.RecentFolderUtil;
 import orange.wz.gui.utils.UrlUtil;
 import orange.wz.manager.ServerManager;
@@ -62,11 +64,11 @@ public class MainFrame extends JFrame {
     private boolean defaultPreview = true;
 
     /**
-     * Character 预览开关，开启后选中 img 时会额外展示它的 info 节点
+     * info 预览开关，开启后选中的节点下有 info 时会展示 info 的内容
      * <p>
-     * img 节点上优先级高于默认预览
+     * 有 info 的节点上优先级高于默认预览，没有 info 时仍走默认预览
      */
-    private boolean characterPreview;
+    private boolean infoPreview;
 
     private Color cavFormColor = null;
 
@@ -94,10 +96,19 @@ public class MainFrame extends JFrame {
         } catch (Exception ignored) {
         }
         setTitle("OrzRepacker");
-        setSize(1024, 768);
+        setSize(LayoutUtil.loadWindowSize(1024, 768));
         setLocationRelativeTo(null);
+        if (LayoutUtil.loadWindowMaximized()) {
+            setExtendedState(getExtendedState() | Frame.MAXIMIZED_BOTH);
+        }
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowOpened(WindowEvent e) {
+                // 窗口画出来之后再恢复，这时分割条才知道自己有多宽
+                restoreLayout();
+            }
+
             @Override
             public void windowClosing(WindowEvent e) {
                 saveConfig();
@@ -173,9 +184,9 @@ public class MainFrame extends JFrame {
             refreshSelection();
         });
 
-        JCheckBoxMenuItem characterPreviewMenu = new JCheckBoxMenuItem(i18n.get("menu.tool.characterPreview"));
-        characterPreviewMenu.addActionListener(e -> {
-            characterPreview = characterPreviewMenu.isSelected();
+        JCheckBoxMenuItem infoPreviewMenu = new JCheckBoxMenuItem(i18n.get("menu.tool.infoPreview"));
+        infoPreviewMenu.addActionListener(e -> {
+            infoPreview = infoPreviewMenu.isSelected();
             refreshSelection();
         });
 
@@ -185,7 +196,7 @@ public class MainFrame extends JFrame {
         tools.add(selectCavBGC);
         tools.add(view);
         tools.add(defaultPreviewMenu);
-        tools.add(characterPreviewMenu);
+        tools.add(infoPreviewMenu);
         tools.add(clearCB);
         tools.add(gc);
 
@@ -422,8 +433,11 @@ public class MainFrame extends JFrame {
      */
     public void updateProgress(int current, int total) {
         int percent = (int) ((double) current / total * 100);
-        progressBar.setValue(percent);
-        progressBar.setString(current + "/" + total);
+        // 解析/保存都是在后台线程里调的，界面更新要排回 EDT
+        EdtUtil.later(() -> {
+            progressBar.setValue(percent);
+            progressBar.setString(current + "/" + total);
+        });
     }
 
     /**
@@ -432,24 +446,24 @@ public class MainFrame extends JFrame {
      * @param message 文字
      */
     public void setStatusText(String message) {
-        if (statusLabel != null) {
-            statusLabel.setText(message);
-        }
+        updateStatusLabel(message);
         log.info(message);
     }
 
     public void setStatusTextWithWarnLog(String message) {
-        if (statusLabel != null) {
-            statusLabel.setText(message);
-        }
+        updateStatusLabel(message);
         log.warn(message);
     }
 
     public void setStatusTextWithErrLog(String message) {
-        if (statusLabel != null) {
-            statusLabel.setText(message);
-        }
+        updateStatusLabel(message);
         log.error(message);
+    }
+
+    private void updateStatusLabel(String message) {
+        if (statusLabel == null) return;
+        // 后台线程也会更新状态栏，排回 EDT 再改
+        EdtUtil.later(() -> statusLabel.setText(message));
     }
 
     private void gc() {
@@ -590,5 +604,54 @@ public class MainFrame extends JFrame {
         if (wzKey != null) {
             prefs.put("keybox", String.valueOf(wzKey.getId()));
         }
+
+        saveLayout();
+    }
+
+    /**
+     * 记下窗口大小、视图开关和两侧各自加载了什么，下次启动照着恢复
+     */
+    private void saveLayout() {
+        boolean maximized = (getExtendedState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH;
+        LayoutUtil.saveWindow(getWidth(), getHeight(), maximized);
+
+        LayoutUtil.saveRightShowing(centerPane.isRightShowing());
+        LayoutUtil.saveLeftFiles(centerPane.getLeftEditPane().getLoadedFilePaths());
+        LayoutUtil.saveRightFiles(centerPane.getRightEditPane().getLoadedFilePaths());
+    }
+
+    /**
+     * 按上次关闭时的布局恢复：先摆好视图，再把文件加载回原来那一侧
+     * <p>
+     * 用的是菜单栏当前选中的密钥，和手动加载走的是同一条路
+     */
+    private void restoreLayout() {
+        if (LayoutUtil.loadRightShowing()) {
+            centerPane.showRightEditPane(true);
+        }
+
+        List<File> leftFiles = LayoutUtil.loadLeftFiles();
+        List<File> rightFiles = LayoutUtil.loadRightFiles();
+        if (leftFiles.isEmpty() && rightFiles.isEmpty()) {
+            return;
+        }
+
+        setStatusText(i18n.get("status.layout_restoring"));
+
+        // 记的文件可能已经被改名/换了密钥，恢复失败不该拦住启动
+        try {
+            if (!leftFiles.isEmpty()) {
+                centerPane.getLeftEditPane().loadFiles(leftFiles);
+            }
+            if (!rightFiles.isEmpty()) {
+                centerPane.getRightEditPane().loadFiles(rightFiles);
+            }
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+            setStatusTextWithWarnLog(i18n.get("warn.layout_restore_failed"));
+            return;
+        }
+
+        setStatusText(i18n.get("status.layout_restored", leftFiles.size() + rightFiles.size()));
     }
 }
